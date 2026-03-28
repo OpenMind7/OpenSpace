@@ -329,6 +329,63 @@ class ExecutionAnalysis:
         )
 
 
+_FAILURE_MODES = frozenset({
+    "wrong_tool_sequence", "api_misuse", "missing_prerequisite",
+    "scope_creep", "auth_error", "rate_limit", "data_format", "other",
+})
+
+
+@dataclass
+class FailureLesson:
+    """Distilled lesson from a failed task — injected as NEGATIVE guidance."""
+
+    lesson_id: str                                        # uuid hex
+    task_id: str                                          # source ExecutionAnalysis.task_id
+    skill_ids: List[str] = field(default_factory=list)   # skills active at failure
+    task_summary: str = ""                               # what was attempted
+    failure_mode: str = "other"                          # one of _FAILURE_MODES
+    lesson_text: str = ""                                # "avoid X because Y"
+    tool_culprits: List[str] = field(default_factory=list)
+    confidence: float = 0.7                              # gate: skip if < 0.7
+    created_at: datetime = field(default_factory=datetime.now)
+    expires_at: Optional[datetime] = None                # 30-day TTL from created_at
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "lesson_id": self.lesson_id,
+            "task_id": self.task_id,
+            "skill_ids": self.skill_ids,
+            "task_summary": self.task_summary,
+            "failure_mode": self.failure_mode,
+            "lesson_text": self.lesson_text,
+            "tool_culprits": self.tool_culprits,
+            "confidence": self.confidence,
+            "created_at": self.created_at.isoformat(),
+            "expires_at": self.expires_at.isoformat() if self.expires_at else None,
+        }
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "FailureLesson":
+        expires = None
+        if data.get("expires_at"):
+            expires = datetime.fromisoformat(data["expires_at"])
+        return cls(
+            lesson_id=data["lesson_id"],
+            task_id=data["task_id"],
+            skill_ids=data.get("skill_ids", []),
+            task_summary=data.get("task_summary", ""),
+            failure_mode=data.get("failure_mode", "other"),
+            lesson_text=data.get("lesson_text", ""),
+            tool_culprits=data.get("tool_culprits", []),
+            confidence=data.get("confidence", 0.7),
+            created_at=(
+                datetime.fromisoformat(data["created_at"])
+                if data.get("created_at") else datetime.now()
+            ),
+            expires_at=expires,
+        )
+
+
 # Full skill profile (identity + lineage + deps + quality)
 @dataclass
 class SkillRecord:

@@ -34,6 +34,7 @@ from .skill_ranker import SkillRanker, SkillCandidate, PREFILTER_THRESHOLD
 
 if TYPE_CHECKING:
     from openspace.llm import LLMClient
+    from openspace.skill_engine.store import SkillStore
 
 logger = Logger.get_logger(__name__)
 
@@ -355,6 +356,7 @@ class SkillRegistry:
         max_skills: int = 2,
         model: Optional[str] = None,
         skill_quality: Optional[Dict[str, Dict[str, Any]]] = None,
+        store: Optional["SkillStore"] = None,
     ) -> tuple[List[SkillMeta], Optional[Dict[str, Any]]]:
         """Use an LLM to select the most relevant skills.
 
@@ -451,8 +453,22 @@ class SkillRegistry:
                 catalog_lines.append(f"- **{s.skill_id}**: {s.description}")
         skills_catalog = "\n".join(catalog_lines)
 
+        failure_context = ""
+        if store is not None:
+            lessons = store.get_recent_failure_lessons(
+                [s.skill_id for s in available], limit=5
+            )
+            if lessons:
+                parts = []
+                for i, lesson in enumerate(lessons, 1):
+                    parts.append(
+                        f"{i}. **{lesson.failure_mode}** (confidence {lesson.confidence:.0%}): "
+                        f"{lesson.lesson_text}"
+                    )
+                failure_context = "\n".join(parts)
+
         prompt = self._build_skill_selection_prompt(
-            task_description, skills_catalog, max_skills
+            task_description, skills_catalog, max_skills, failure_context
         )
 
         selection_record: Dict[str, Any] = {
@@ -678,12 +694,21 @@ class SkillRegistry:
         task: str,
         skills_catalog: str,
         max_skills: int,
+        failure_context: str = "",
     ) -> str:
         """Build the prompt for LLM skill selection.
 
         Uses a plan-then-select pattern: the LLM first writes a brief
         execution plan, then selects skills that match the plan.
+
+        Args:
+            failure_context: Optional NEGATIVE guidance from past failures.
+                When provided, injected before Instructions as a warning section.
         """
+        failure_section = (
+            f"\n# Known Failure Patterns (AVOID)\n\n{failure_context}\n"
+            if failure_context else ""
+        )
         return f"""You are a skill selector for an autonomous agent.
 
 # Task
@@ -692,7 +717,7 @@ class SkillRegistry:
 
 # Available Skills
 
-{skills_catalog}
+{skills_catalog}{failure_section}
 
 # Instructions
 

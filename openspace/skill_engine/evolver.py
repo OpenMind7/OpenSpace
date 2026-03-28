@@ -23,6 +23,7 @@ import re
 import shutil
 import uuid
 from dataclasses import dataclass, field
+from datetime import datetime
 from enum import Enum
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, TYPE_CHECKING
@@ -31,6 +32,7 @@ from .types import (
     EvolutionSuggestion,
     EvolutionType,
     ExecutionAnalysis,
+    FailureLesson,
     SkillCategory,
     SkillLineage,
     SkillOrigin,
@@ -273,7 +275,17 @@ class SkillEvolver:
         Called immediately after ``ExecutionAnalyzer.analyze_execution()``.
         Each suggestion becomes one evolution action, executed in parallel
         (throttled by semaphore).
+
+        Also fires failure-trajectory distillation as a background task
+        whenever the execution did not complete successfully.
         """
+        # Distill failure lesson independently of evolution suggestions
+        if not analysis.task_completed:
+            asyncio.create_task(
+                self._distill_failure_bg(analysis),
+                name=f"distill_failure:{analysis.task_id}",
+            )
+
         if not analysis.candidate_for_evolution:
             return []
 
@@ -296,6 +308,94 @@ class SkillEvolver:
                 f"from task {analysis.task_id}"
             )
         return results
+
+    async def _distill_failure_bg(self, analysis: ExecutionAnalysis) -> None:
+        """Background wrapper — distill failure without blocking process_analysis."""
+        try:
+            async with self._semaphore:
+                await self._distill_failure(analysis)
+        except Exception as e:
+            logger.debug("Failure distillation failed (non-fatal): %s", e)
+
+    async def _distill_failure(self, analysis: ExecutionAnalysis) -> None:
+        """Distill a FailureLesson from a failed task execution.
+
+        Uses LLM to extract failure_mode, lesson_text, and tool_culprits.
+        Gates on confidence >= 0.7. Stores with 30-day TTL.
+        """
+        from datetime import timedelta
+
+        skill_ids = [j.skill_id for j in analysis.skill_judgments]
+        history = self._format_analysis_context([analysis])
+        model = self._model or self._llm_client.model
+
+        prompt = f"""A task execution FAILED. Extract a reusable failure lesson.
+
+Task ID: {analysis.task_id}
+Execution note: {analysis.execution_note or "(none)"}
+Tool issues: {', '.join(analysis.tool_issues) or "(none)"}
+Skills active: {', '.join(skill_ids) or "(none)"}
+
+{history}
+
+Respond with JSON only:
+{{
+  "task_summary": "one sentence: what was attempted",
+  "failure_mode": "one of: wrong_tool_sequence|api_misuse|missing_prerequisite|scope_creep|auth_error|rate_limit|data_format|other",
+  "lesson_text": "what to avoid next time (2-3 sentences, actionable)",
+  "tool_culprits": ["tool_key_1"],
+  "confidence": 0.0
+}}"""
+
+        try:
+            from gdpval_bench.token_tracker import set_call_source, reset_call_source
+            _src_tok = set_call_source("skill_evolution")
+        except ImportError:
+            _src_tok = None
+
+        try:
+            result = await self._llm_client.complete(
+                messages=[{"role": "user", "content": prompt}],
+                model=model,
+            )
+        finally:
+            if _src_tok is not None:
+                reset_call_source(_src_tok)
+
+        content = result["message"].get("content", "").strip()
+        m = re.search(r"\{.*\}", content, re.DOTALL)
+        if not m:
+            logger.debug("distill_failure: no JSON in response for task %s", analysis.task_id)
+            return
+        try:
+            data = json.loads(m.group())
+        except Exception:
+            return
+
+        confidence = float(data.get("confidence", 0.0))
+        if confidence < 0.7:
+            logger.debug(
+                "distill_failure: confidence %.2f < 0.7, skipping task %s",
+                confidence, analysis.task_id,
+            )
+            return
+
+        lesson = FailureLesson(
+            lesson_id=uuid.uuid4().hex,
+            task_id=analysis.task_id,
+            skill_ids=skill_ids,
+            task_summary=data.get("task_summary", ""),
+            failure_mode=data.get("failure_mode", "other"),
+            lesson_text=data.get("lesson_text", ""),
+            tool_culprits=data.get("tool_culprits", []),
+            confidence=confidence,
+            expires_at=datetime.now() + timedelta(days=30),
+        )
+        await self._store.add_failure_lesson(lesson)
+        logger.info(
+            "Failure lesson distilled [%s]: %s",
+            lesson.failure_mode, lesson.task_summary[:60],
+        )
 
     # Trigger 2: tool quality degradation
     async def process_tool_degradation(

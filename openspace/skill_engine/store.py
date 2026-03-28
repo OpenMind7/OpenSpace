@@ -162,6 +162,21 @@ CREATE TABLE IF NOT EXISTS skill_tags (
     tag      TEXT NOT NULL,
     PRIMARY KEY (skill_id, tag)
 );
+
+CREATE TABLE IF NOT EXISTS failure_lessons (
+    lesson_id     TEXT PRIMARY KEY,
+    task_id       TEXT NOT NULL,
+    skill_ids     TEXT NOT NULL DEFAULT '[]',
+    task_summary  TEXT NOT NULL DEFAULT '',
+    failure_mode  TEXT NOT NULL DEFAULT 'other',
+    lesson_text   TEXT NOT NULL DEFAULT '',
+    tool_culprits TEXT NOT NULL DEFAULT '[]',
+    confidence    REAL NOT NULL DEFAULT 0.7,
+    created_at    TEXT NOT NULL,
+    expires_at    TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_fl_task    ON failure_lessons(task_id);
+CREATE INDEX IF NOT EXISTS idx_fl_created ON failure_lessons(created_at);
 """
 
 
@@ -1143,6 +1158,84 @@ class SkillStore:
                     self._subtree(conn, cid, depth - 1, visited)
                 )
         return node
+
+    # Failure lesson API
+    async def add_failure_lesson(self, lesson: "FailureLesson") -> None:
+        """Persist a distilled failure lesson."""
+        await asyncio.to_thread(self._add_failure_lesson_sync, lesson)
+
+    def _add_failure_lesson_sync(self, lesson: "FailureLesson") -> None:
+        from openspace.skill_engine.types import FailureLesson as _FL  # noqa: F401
+        with self._mu:
+            self._conn.execute(
+                """
+                INSERT OR REPLACE INTO failure_lessons
+                (lesson_id, task_id, skill_ids, task_summary, failure_mode,
+                 lesson_text, tool_culprits, confidence, created_at, expires_at)
+                VALUES (?,?,?,?,?,?,?,?,?,?)
+                """,
+                (
+                    lesson.lesson_id,
+                    lesson.task_id,
+                    json.dumps(lesson.skill_ids),
+                    lesson.task_summary,
+                    lesson.failure_mode,
+                    lesson.lesson_text,
+                    json.dumps(lesson.tool_culprits),
+                    lesson.confidence,
+                    lesson.created_at.isoformat(),
+                    lesson.expires_at.isoformat() if lesson.expires_at else None,
+                ),
+            )
+            self._conn.commit()
+
+    def get_recent_failure_lessons(
+        self, skill_ids: List[str], limit: int = 5
+    ) -> List["FailureLesson"]:
+        """Return recent non-expired lessons, preferring those matching *skill_ids*."""
+        from openspace.skill_engine.types import FailureLesson
+        now_iso = datetime.now().isoformat()
+        with self._reader() as conn:
+            rows = conn.execute(
+                """
+                SELECT * FROM failure_lessons
+                WHERE (expires_at IS NULL OR expires_at > ?)
+                ORDER BY created_at DESC
+                LIMIT ?
+                """,
+                (now_iso, limit * 3),
+            ).fetchall()
+        lessons = [
+            FailureLesson.from_dict({
+                **dict(r),
+                "skill_ids": json.loads(r["skill_ids"]),
+                "tool_culprits": json.loads(r["tool_culprits"]),
+            })
+            for r in rows
+        ]
+        # Prefer lessons that overlap with the candidate skill_ids
+        sid_set = set(skill_ids)
+        scored = sorted(
+            lessons,
+            key=lambda l: (bool(set(l.skill_ids) & sid_set), l.created_at),
+            reverse=True,
+        )
+        return scored[:limit]
+
+    async def prune_expired_failure_lessons(self) -> int:
+        """Delete expired failure lessons. Returns number of rows removed."""
+        return await asyncio.to_thread(self._prune_expired_lessons_sync)
+
+    def _prune_expired_lessons_sync(self) -> int:
+        now_iso = datetime.now().isoformat()
+        with self._mu:
+            cur = self._conn.execute(
+                "DELETE FROM failure_lessons "
+                "WHERE expires_at IS NOT NULL AND expires_at <= ?",
+                (now_iso,),
+            )
+            self._conn.commit()
+            return cur.rowcount
 
     # Maintenance
     def clear(self) -> None:
