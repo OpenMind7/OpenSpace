@@ -695,14 +695,14 @@ class OpenSpace:
                 store=self._skill_store,
             )
         else:
-            # No LLM client — skip skill selection entirely
-            logger.info("No LLM client available for skill selection — proceeding without skills")
-            selected = []
+            # No LLM client — use local prefilter (BM25+embedding, Stage 3 if enabled)
+            logger.info("No LLM client available for skill selection — using local prefilter")
+            selected = self._skill_registry.select_skills_without_llm(task, max_skills=max_select)
             selection_record = {
-                "method": "no_llm",
+                "method": "no_llm_prefilter",
                 "task": task[:500],
                 "available_skills": [s.skill_id for s in self._skill_registry.list_skills()],
-                "selected": [],
+                "selected": [s.skill_id for s in selected],
             }
 
         # Record skill selection to metadata.json

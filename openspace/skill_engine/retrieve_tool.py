@@ -85,23 +85,8 @@ class RetrieveSkillTool(LocalTool):
                 if plan:
                     logger.info(f"retrieve_skill plan: {plan}")
         else:
-            # Fallback: BM25+embedding only (no LLM available)
-            from openspace.cloud.search import hybrid_search_skills
-
-            results = await hybrid_search_skills(
-                query=query,
-                local_skills=self._skill_registry.list_skills(),
-                source="local",
-                limit=1,
-            )
-            if not results:
-                return "No relevant skills found for this query."
-
-            hit_ids = {r["skill_id"] for r in results}
-            selected = [
-                s for s in self._skill_registry.list_skills()
-                if s.skill_id in hit_ids
-            ]
+            # Fallback: use registry prefilter (BM25+embedding, Stage 3 if enabled)
+            selected = self._skill_registry.select_skills_without_llm(query, max_skills=1)
 
         if not selected:
             return "No relevant skills found for this query."

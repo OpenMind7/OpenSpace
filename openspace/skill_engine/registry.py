@@ -559,9 +559,10 @@ class SkillRegistry:
 
         ranked = self.ranker.hybrid_rank(task, candidates, top_k=prefilter_top_k)
 
-        # Map back to SkillMeta
-        ranked_ids = {c.skill_id for c in ranked}
-        result = [s for s in available if s.skill_id in ranked_ids]
+        # Map back to SkillMeta preserving Stage 3 order
+        ranked_ids = [c.skill_id for c in ranked]
+        meta_by_id = {s.skill_id: s for s in available}
+        result = [meta_by_id[sid] for sid in ranked_ids if sid in meta_by_id]
 
         if len(result) < len(available):
             logger.info(
@@ -569,6 +570,24 @@ class SkillRegistry:
                 f"(BM25+embedding, threshold={PREFILTER_THRESHOLD})"
             )
         return result
+
+    def select_skills_without_llm(
+        self,
+        task_description: str,
+        max_skills: int = 2,
+    ) -> List[SkillMeta]:
+        """Select skills using BM25+embedding prefilter only (no LLM required).
+
+        Used as a fallback when no LLM client is available, ensuring Stage 3
+        reranking still runs rather than returning an empty set.
+        """
+        self._ensure_discovered()
+        if not task_description:
+            return []
+        available = list(self._skills.values())
+        if not available:
+            return []
+        return self._prefilter_skills(task_description, available, max_skills)[:max_skills]
 
     def load_skill_content(self, skill_id: str) -> Optional[str]:
         """Return the SKILL.md content (with frontmatter stripped) for *skill_id*."""

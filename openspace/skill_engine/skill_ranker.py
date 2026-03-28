@@ -23,6 +23,7 @@ import math
 import os
 import pickle
 import re
+import time
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -83,6 +84,8 @@ class SkillRanker:
         enable_cross_encoder: bool = False,
         cross_encoder_model: str = "cross-encoder/ms-marco-MiniLM-L-6-v2",
         cross_encoder_top_k: int = 5,
+        rerank_cache_max_entries: int = 1024,
+        rerank_cache_ttl_seconds: int = 3600,
     ) -> None:
         # Embedding cache: skill_id → List[float]
         self._embedding_cache: Dict[str, List[float]] = {}
@@ -92,8 +95,10 @@ class SkillRanker:
         self._cross_encoder_model_name = cross_encoder_model
         self._cross_encoder_top_k = cross_encoder_top_k
         self._cross_encoder: Any = None  # loaded on first use
-        # Rerank cache: sha256[:16] → ordered List[skill_id]
-        self._rerank_cache: Dict[str, List[str]] = {}
+        # Rerank cache: sha256[:16] → (cached_at, ordered List[skill_id])
+        self._rerank_cache: Dict[str, Tuple[float, List[str]]] = {}
+        self._rerank_cache_max_entries = rerank_cache_max_entries
+        self._rerank_cache_ttl_seconds = rerank_cache_ttl_seconds
 
         if cache_dir is None:
             try:
@@ -128,17 +133,17 @@ class SkillRanker:
             # BM25 found nothing — try embedding on all candidates
             emb_results = self._embedding_rank(query, candidates, top_k)
             stage2 = emb_results if emb_results else candidates[:top_k]
-            return self.rerank(query, stage2) if self._enable_cross_encoder else stage2
+            return self.rerank(query, stage2, top_k=top_k) if self._enable_cross_encoder else stage2
 
         # Stage 2: Embedding re-rank on BM25 candidates
         emb_results = self._embedding_rank(query, bm25_top, top_k)
         if emb_results:
-            return self.rerank(query, emb_results) if self._enable_cross_encoder else emb_results
+            return self.rerank(query, emb_results, top_k=top_k) if self._enable_cross_encoder else emb_results
 
         # Embedding unavailable — return BM25 results
         logger.debug("Embedding unavailable, using BM25-only results")
         stage2 = bm25_top[:top_k]
-        return self.rerank(query, stage2) if self._enable_cross_encoder else stage2
+        return self.rerank(query, stage2, top_k=top_k) if self._enable_cross_encoder else stage2
 
     def rerank(
         self,
@@ -161,11 +166,14 @@ class SkillRanker:
         cache_key = hashlib.sha256(
             f"{query}|{','.join(sorted(c.skill_id for c in candidates))}".encode()
         ).hexdigest()[:16]
-        if cache_key in self._rerank_cache:
-            ordered_ids = self._rerank_cache[cache_key]
-            id_to_c = {c.skill_id: c for c in candidates}
-            result = [id_to_c[sid] for sid in ordered_ids if sid in id_to_c]
-            return result[:k]
+        cached = self._rerank_cache.get(cache_key)
+        if cached:
+            cached_at, ordered_ids = cached
+            if time.monotonic() - cached_at <= self._rerank_cache_ttl_seconds:
+                id_to_c = {c.skill_id: c for c in candidates}
+                result = [id_to_c[sid] for sid in ordered_ids if sid in id_to_c]
+                return result[:k]
+            self._rerank_cache.pop(cache_key, None)
 
         ce = self._get_cross_encoder()
         if ce is None:
@@ -183,7 +191,9 @@ class SkillRanker:
 
         ranked = sorted(zip(candidates, scores), key=lambda x: x[1], reverse=True)
         result = [c for c, _ in ranked]
-        self._rerank_cache[cache_key] = [c.skill_id for c in result]
+        self._rerank_cache[cache_key] = (time.monotonic(), [c.skill_id for c in result])
+        while len(self._rerank_cache) > self._rerank_cache_max_entries:
+            self._rerank_cache.pop(next(iter(self._rerank_cache)))
         return result[:k]
 
     def _get_cross_encoder(self) -> Any:
