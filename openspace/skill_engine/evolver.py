@@ -218,6 +218,9 @@ class SkillEvolver:
         # At most one pending rerun per label (last-write-wins).
         self._pending_reruns: Dict[str, Any] = {}
 
+        # W6 Step 13: counter for periodic bandit decay (every 100 analyses).
+        self._analysis_count: int = 0
+
     def set_available_tools(self, tools: List["BaseTool"]) -> None:
         """Update the tools available for evolution agent loops."""
         self._available_tools = list(tools)
@@ -299,6 +302,15 @@ class SkillEvolver:
             label="fine_tune_embeddings",
         )
 
+        # W6 Step 13: Periodic bandit decay — prevents exploration collapse.
+        # Shrinks Beta posteriors toward Beta(1,1) every 100 analyses.
+        self._analysis_count += 1
+        if self._analysis_count % 100 == 0:
+            self.schedule_background(
+                self._decay_bandits_bg(),
+                label="bandit_decay",
+            )
+
         if not analysis.candidate_for_evolution:
             return []
 
@@ -368,6 +380,20 @@ class SkillEvolver:
                     logger.info("Embedding fine-tune complete (version=%d)", ranker._embedding_version)
         except Exception as exc:
             logger.debug("Fine-tune from outcomes failed (non-fatal): %s", exc)
+
+    async def _decay_bandits_bg(self) -> None:
+        """W6 Step 13: Decay Beta posteriors toward Beta(1,1) — prevents exploration collapse.
+
+        Runs every 100 analyses.  Skills with high accumulated alpha/beta that
+        stop receiving dispatch events are gradually returned toward prior
+        uncertainty, ensuring the TS sampler continues to explore.
+        """
+        try:
+            updated = await self._store.decay_bandit_posteriors()
+            if updated:
+                logger.debug("Bandit decay applied to %d skill(s)", updated)
+        except Exception as exc:
+            logger.debug("Bandit decay failed (non-fatal): %s", exc)
 
     async def _distill_failure(self, analysis: ExecutionAnalysis) -> None:
         """Distill a FailureLesson from a failed task execution.

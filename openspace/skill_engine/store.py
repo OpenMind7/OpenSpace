@@ -192,11 +192,12 @@ CREATE TABLE IF NOT EXISTS skill_bandit (
 -- Written at selection time regardless of recording state,
 -- so TS posteriors and selection methods are always traceable.
 CREATE TABLE IF NOT EXISTS skill_dispatch_events (
-    id            INTEGER PRIMARY KEY AUTOINCREMENT,
-    task_id       TEXT NOT NULL,
-    skill_ids     TEXT NOT NULL DEFAULT '[]',
-    method        TEXT NOT NULL DEFAULT '',
-    dispatched_at TEXT NOT NULL
+    id               INTEGER PRIMARY KEY AUTOINCREMENT,
+    task_id          TEXT NOT NULL,
+    skill_ids        TEXT NOT NULL DEFAULT '[]',
+    method           TEXT NOT NULL DEFAULT '',
+    dispatched_at    TEXT NOT NULL,
+    bandit_snapshot  TEXT NOT NULL DEFAULT '{}'
 );
 CREATE INDEX IF NOT EXISTS idx_sde_task ON skill_dispatch_events(task_id);
 CREATE INDEX IF NOT EXISTS idx_sde_ts   ON skill_dispatch_events(dispatched_at);
@@ -345,6 +346,14 @@ class SkillStore:
         """Create tables if they don't exist (idempotent via IF NOT EXISTS)."""
         with self._mu:
             self._conn.executescript(_DDL)
+            # Migrate existing DBs: add bandit_snapshot to skill_dispatch_events
+            try:
+                self._conn.execute(
+                    "ALTER TABLE skill_dispatch_events "
+                    "ADD COLUMN bandit_snapshot TEXT NOT NULL DEFAULT '{}'"
+                )
+            except Exception:
+                pass  # column already exists
             self._conn.commit()
 
     # Lifecycle
@@ -1393,29 +1402,70 @@ class SkillStore:
     # --- Dispatch Events ---
 
     async def record_dispatch_event(
-        self, task_id: str, skill_ids: List[str], method: str
+        self,
+        task_id: str,
+        skill_ids: List[str],
+        method: str,
+        bandit_snapshot: Optional[Dict[str, Any]] = None,
     ) -> None:
         """Persist a skill dispatch event — written regardless of recording state.
 
         Provides a durable audit trail for TS posteriors and selection methods
         even when metadata.json recording is disabled.
+
+        ``bandit_snapshot`` captures the alpha/beta posteriors for the final
+        injected skill set at selection time, enabling offline replay and
+        retrospective analysis of TS exploration decisions.
         """
         await asyncio.to_thread(
-            self._record_dispatch_event_sync, task_id, skill_ids, method
+            self._record_dispatch_event_sync, task_id, skill_ids, method, bandit_snapshot
         )
 
     @_db_retry()
     def _record_dispatch_event_sync(
-        self, task_id: str, skill_ids: List[str], method: str
+        self,
+        task_id: str,
+        skill_ids: List[str],
+        method: str,
+        bandit_snapshot: Optional[Dict[str, Any]] = None,
     ) -> None:
         now_iso = datetime.now().isoformat()
+        snapshot_json = json.dumps(bandit_snapshot or {})
         with self._mu:
             self._conn.execute(
                 "INSERT INTO skill_dispatch_events "
-                "(task_id, skill_ids, method, dispatched_at) VALUES (?, ?, ?, ?)",
-                (task_id, json.dumps(skill_ids), method, now_iso),
+                "(task_id, skill_ids, method, dispatched_at, bandit_snapshot) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (task_id, json.dumps(skill_ids), method, now_iso, snapshot_json),
             )
             self._conn.commit()
+
+    async def decay_bandit_posteriors(self, *, decay_factor: float = 0.99) -> int:
+        """Shrink Beta posteriors toward Beta(1,1) by *decay_factor*.
+
+        Prevents exploration collapse: skills with high accumulated confidence
+        that stop receiving feedback are gradually returned toward prior
+        uncertainty so that exploration can resume.  Only affects skills that
+        have been dispatched at least once.
+
+        Returns the number of rows updated.
+        """
+        return await asyncio.to_thread(self._decay_bandit_posteriors_sync, decay_factor)
+
+    @_db_retry()
+    def _decay_bandit_posteriors_sync(self, decay_factor: float) -> int:
+        now_iso = datetime.now().isoformat()
+        with self._mu:
+            cur = self._conn.execute(
+                "UPDATE skill_bandit SET "
+                "  alpha = 1.0 + (alpha - 1.0) * :d, "
+                "  beta  = 1.0 + (beta  - 1.0) * :d, "
+                "  last_updated = :now "
+                "WHERE total_dispatches > 0",
+                {"d": decay_factor, "now": now_iso},
+            )
+            self._conn.commit()
+            return cur.rowcount
 
     # --- Contrastive Embedding Training (W6-P2) ---
 

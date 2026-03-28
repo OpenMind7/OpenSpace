@@ -731,6 +731,8 @@ class OpenSpace:
 
         # W6-P1: Thompson Sampling blend — reorder pool by TS posterior + hybrid score,
         # then truncate to max_select. top_k truncation happens inside ts_blend_reorder.
+        # bandit_stats hoisted so it's available for snapshot after truncation (Step 12).
+        bandit_stats = None
         if self._skill_store and selected:
             try:
                 bandit_stats = self._skill_store.get_bandit_stats(
@@ -741,6 +743,7 @@ class OpenSpace:
                 )
             except Exception as _ts_exc:
                 logger.debug("TS blend failed — using hybrid order: %s", _ts_exc)
+                bandit_stats = None
                 selected = selected[:max_select]  # fallback truncation
         else:
             selected = selected[:max_select]  # no TS — take top max_select directly
@@ -751,6 +754,17 @@ class OpenSpace:
         # actually injected. Analyzer trusts this field as the injected-skill list.
         if selection_record:
             selection_record["selected"] = [s.skill_id for s in selected]
+
+        # W6 Step 12: Capture alpha/beta posteriors for the final injected set.
+        # Snapshot taken after truncation so only actually-dispatched skills are recorded.
+        bandit_snapshot: Dict[str, Any] = {}
+        if bandit_stats:
+            final_ids = {s.skill_id for s in selected}
+            bandit_snapshot = {
+                sid: {"alpha": s.alpha, "beta": s.beta}
+                for sid, s in bandit_stats.items()
+                if sid in final_ids
+            }
 
         # Record skill selection to metadata.json
         if self._recording_manager and selection_record:
@@ -775,7 +789,7 @@ class OpenSpace:
             try:
                 dispatch_method = (selection_record or {}).get("method", "llm")
                 await self._skill_store.record_dispatch_event(
-                    task_id, skill_ids, dispatch_method
+                    task_id, skill_ids, dispatch_method, bandit_snapshot=bandit_snapshot
                 )
             except Exception as _de_exc:
                 logger.debug("Dispatch event record failed (non-fatal): %s", _de_exc)
