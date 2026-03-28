@@ -186,6 +186,19 @@ CREATE TABLE IF NOT EXISTS skill_bandit (
     total_dispatches INTEGER NOT NULL DEFAULT 0,
     last_updated     TEXT    NOT NULL
 );
+
+-- Durable audit trail for skill dispatch decisions.
+-- Written at selection time regardless of recording state,
+-- so TS posteriors and selection methods are always traceable.
+CREATE TABLE IF NOT EXISTS skill_dispatch_events (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    task_id       TEXT NOT NULL,
+    skill_ids     TEXT NOT NULL DEFAULT '[]',
+    method        TEXT NOT NULL DEFAULT '',
+    dispatched_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_sde_task ON skill_dispatch_events(task_id);
+CREATE INDEX IF NOT EXISTS idx_sde_ts   ON skill_dispatch_events(dispatched_at);
 """
 
 
@@ -1325,6 +1338,33 @@ class SkillStore:
             )
             self._conn.commit()
 
+    # --- Dispatch Events ---
+
+    async def record_dispatch_event(
+        self, task_id: str, skill_ids: List[str], method: str
+    ) -> None:
+        """Persist a skill dispatch event — written regardless of recording state.
+
+        Provides a durable audit trail for TS posteriors and selection methods
+        even when metadata.json recording is disabled.
+        """
+        await asyncio.to_thread(
+            self._record_dispatch_event_sync, task_id, skill_ids, method
+        )
+
+    @_db_retry()
+    def _record_dispatch_event_sync(
+        self, task_id: str, skill_ids: List[str], method: str
+    ) -> None:
+        now_iso = datetime.now().isoformat()
+        with self._mu:
+            self._conn.execute(
+                "INSERT INTO skill_dispatch_events "
+                "(task_id, skill_ids, method, dispatched_at) VALUES (?, ?, ?, ?)",
+                (task_id, json.dumps(skill_ids), method, now_iso),
+            )
+            self._conn.commit()
+
     # Maintenance
     def clear(self) -> None:
         """Delete all data (keeps schema)."""
@@ -1336,6 +1376,10 @@ class SkillStore:
                 self._conn.execute("DELETE FROM skill_records")
                 # execution_analyses CASCADE cleans up skill_judgments
                 self._conn.execute("DELETE FROM execution_analyses")
+                # Clear independent tables (no FK cascade)
+                self._conn.execute("DELETE FROM failure_lessons")
+                self._conn.execute("DELETE FROM skill_bandit")
+                self._conn.execute("DELETE FROM skill_dispatch_events")
                 self._conn.commit()
                 logger.info("SkillStore cleared")
             except Exception:

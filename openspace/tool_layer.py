@@ -419,7 +419,7 @@ class OpenSpace:
 
             # Phase 1: Skill-guided execution
             if self._skill_registry:
-                has_skills = await self._select_and_inject_skills(task)
+                has_skills = await self._select_and_inject_skills(task, task_id=task_id)
 
             if has_skills:
                 logger.info(
@@ -666,6 +666,7 @@ class OpenSpace:
     async def _select_and_inject_skills(
         self,
         task: str,
+        task_id: str = "",
     ) -> bool:
         """Select skills for task via LLM, inject into GroundingAgent.
 
@@ -750,6 +751,17 @@ class OpenSpace:
         skill_ids = [s.skill_id for s in selected]
         self._grounding_agent.set_skill_context(context_text, skill_ids)
         logger.info(f"Injected {len(selected)} active skill(s): {skill_ids}")
+
+        # MEDIUM-5: Persist dispatch event regardless of recording state.
+        # Provides durable TS audit trail even when metadata.json recording is off.
+        if self._skill_store and task_id and skill_ids:
+            try:
+                dispatch_method = (selection_record or {}).get("method", "llm")
+                await self._skill_store.record_dispatch_event(
+                    task_id, skill_ids, dispatch_method
+                )
+            except Exception as _de_exc:
+                logger.debug("Dispatch event record failed (non-fatal): %s", _de_exc)
 
         return True
 
