@@ -1,22 +1,29 @@
-"""Tests for Wave 3a — BaseConnector asyncio.Lock (race condition fix).
+"""Tests for Wave 3a / Wave 4a — BaseConnector asyncio.Lock (race condition fixes).
 
-Covers:
+Covers (Wave 3a — BaseConnector):
   - concurrent connect() calls only create one session (lock correctness)
   - second connect() is idempotent after first completes (no double-start)
   - concurrent disconnect() calls only stop manager once
   - high-concurrency (10 callers) still produces a single start()
   - _connect_lock attribute exists and is an asyncio.Lock
+
+Covers (Wave 4a — AioHttpConnector ping-inside-lock):
+  - ping failure while a concurrent caller is waiting leaves both callers
+    with _connected=False (no half-ready session observable)
+  - successful ping → both concurrent callers see _connected=True (idempotent)
+  - ping failure triggers _cleanup_on_connect_failure (session closed), not disconnect()
 """
 
 from __future__ import annotations
 
 import asyncio
 from typing import Any
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
 from openspace.grounding.core.transport.connectors.base import BaseConnector
+from openspace.grounding.core.transport.connectors.aiohttp_connector import AioHttpConnector
 from openspace.grounding.core.transport.task_managers import BaseConnectionManager
 
 
@@ -139,3 +146,87 @@ class TestBaseConnectorLock:
         await conn.disconnect()
 
         assert mgr.stop_count == 0
+
+
+# ---------------------------------------------------------------------------
+# AioHttpConnector ping-inside-lock race tests (Wave 4a)
+# ---------------------------------------------------------------------------
+
+class TestAioHttpConnectorPingRace:
+    """Verify that the _after_connect ping fires inside the _connect_lock so no
+    concurrent caller can observe a connected=True state before the ping succeeds.
+    """
+
+    def _make_aiohttp_connector(self, ping_raises=None, ping_status=200):
+        """Build an AioHttpConnector whose HTTP ping is intercepted."""
+        conn = AioHttpConnector.__new__(AioHttpConnector)
+        # Minimal __init__ via BaseConnector
+        mgr = MagicMock()
+        mgr.start = AsyncMock(return_value=MagicMock())  # fake aiohttp session
+        mgr.stop = AsyncMock()
+        BaseConnector.__init__(conn, mgr)
+        conn.base_url = "http://fake"
+
+        # Patch _after_connect at instance level so we control the ping
+        if ping_raises:
+            async def bad_ping():
+                raise ping_raises
+            conn._after_connect = bad_ping
+        else:
+            async def good_ping():
+                pass
+            conn._after_connect = good_ping
+
+        return conn, mgr
+
+    @pytest.mark.asyncio
+    async def test_ping_failure_leaves_connected_false(self):
+        """If the ping fails, _connected must remain False after connect() raises."""
+        conn, mgr = self._make_aiohttp_connector(
+            ping_raises=ConnectionError("ping failed")
+        )
+
+        with pytest.raises(ConnectionError):
+            await conn.connect()
+
+        assert not conn.is_connected, (
+            "_connected must stay False when _after_connect raises"
+        )
+        mgr.stop.assert_awaited_once()  # _cleanup_on_connect_failure must close session
+
+    @pytest.mark.asyncio
+    async def test_concurrent_connect_ping_failure_both_callers_see_disconnected(self):
+        """Concurrent callers: if the first caller's ping fails, the second caller
+        must NOT observe _connected=True at any point during or after the attempt."""
+        conn, mgr = self._make_aiohttp_connector(
+            ping_raises=ConnectionError("ping failed")
+        )
+
+        results = []
+
+        async def try_connect():
+            try:
+                await conn.connect()
+                results.append("connected")
+            except ConnectionError:
+                results.append("failed")
+
+        await asyncio.gather(try_connect(), try_connect())
+
+        # Both callers must see failure; no caller should slip through with connected=True
+        assert all(r == "failed" for r in results), (
+            f"Expected all callers to fail when ping fails; got {results}"
+        )
+        assert not conn.is_connected
+
+    @pytest.mark.asyncio
+    async def test_concurrent_connect_ping_success_all_callers_see_connected(self):
+        """When the ping succeeds, all concurrent callers must observe is_connected=True."""
+        conn, mgr = self._make_aiohttp_connector()  # good ping
+
+        await asyncio.gather(*[conn.connect() for _ in range(5)])
+
+        assert conn.is_connected
+        assert mgr.start.await_count == 1, (
+            "Session must be started exactly once despite concurrent callers"
+        )

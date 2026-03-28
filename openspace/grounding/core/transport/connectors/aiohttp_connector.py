@@ -18,14 +18,21 @@ class AioHttpConnector(BaseConnector[aiohttp.ClientSession]):
         super().__init__(connection_manager)
         self.base_url = base_url.rstrip("/")
         
-    async def connect(self) -> None:
-        await super().connect()
+    async def _after_connect(self) -> None:
+        """Verify the endpoint with a ping while the base _connect_lock is still held.
+
+        Called by BaseConnector.connect() *before* setting _connected=True, so no
+        concurrent caller can observe a half-ready session.  Raising here causes the
+        base class to invoke _cleanup_on_connect_failure() — do NOT call disconnect()
+        from this hook (that would deadlock by re-entering the already-held lock).
+        """
         try:
             async with self._connection.get(self.base_url, timeout=5) as resp:
                 if resp.status >= 500:
                     raise ConnectionError(f"HTTP {resp.status}")
+        except ConnectionError:
+            raise
         except Exception as e:
-            await self.disconnect()
             raise ConnectionError(f"Ping {self.base_url} failed: {e}")
 
     async def _request(

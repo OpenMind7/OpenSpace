@@ -210,6 +210,12 @@ class SkillEvolver:
         # Track background tasks so they can be awaited on shutdown.
         self._background_tasks: Set[asyncio.Task] = set()
 
+        # When a same-label task is in-flight, store the latest replacement coro
+        # here rather than discarding it.  The done-callback _schedule_pending_rerun
+        # will automatically requeue it once the current task completes.
+        # At most one pending rerun per label (last-write-wins).
+        self._pending_reruns: Dict[str, Any] = {}
+
     def set_available_tools(self, tools: List["BaseTool"]) -> None:
         """Update the tools available for evolution agent loops."""
         self._available_tools = list(tools)
@@ -544,22 +550,30 @@ class SkillEvolver:
         try:
             loop = asyncio.get_running_loop()
         except RuntimeError:
+            coro.close()  # prevent 'coroutine was never awaited' ResourceWarning
             logger.warning(f"No running event loop — cannot schedule {label}")
             return None
 
-        # De-duplicate: if a same-label task is still running, discard the new one.
+        # De-duplicate: if a same-label task is still running, queue the new coro
+        # as a pending rerun instead of discarding it.  This ensures that a later
+        # snapshot (e.g. an updated problematic-tools list) is not silently lost.
         if any(t.get_name() == label and not t.done() for t in self._background_tasks):
+            # Close any previously-queued pending coro for this label (stale snapshot).
+            old_pending = self._pending_reruns.pop(label, None)
+            if old_pending is not None:
+                old_pending.close()
+            self._pending_reruns[label] = coro
             logger.debug(
                 f"[schedule_background] '{label}' already in flight — "
-                "discarding duplicate to prevent overlap"
+                "queued as pending rerun (snapshot updated)"
             )
-            coro.close()  # prevent 'coroutine was never awaited' ResourceWarning
             return None
 
         task = loop.create_task(coro, name=label)
         self._background_tasks.add(task)
         task.add_done_callback(self._background_tasks.discard)
         task.add_done_callback(self._log_background_result)
+        task.add_done_callback(self._schedule_pending_rerun)
         return task
 
     @staticmethod
@@ -574,6 +588,32 @@ class SkillEvolver:
                 f"Background task '{task.get_name()}' failed: {exc}",
                 exc_info=exc,
             )
+
+    def _schedule_pending_rerun(self, task: asyncio.Task) -> None:
+        """If a newer coro was queued while *task* was running, schedule it now.
+
+        This is a done-callback: it fires after the task leaves ``_background_tasks``
+        (via the ``discard`` callback registered before this one), so the pending coro
+        will be scheduled as a fresh task with the same label.
+        """
+        label = task.get_name()
+        pending = self._pending_reruns.pop(label, None)
+        if pending is None:
+            return
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            pending.close()
+            return
+        new_task = loop.create_task(pending, name=label)
+        self._background_tasks.add(new_task)
+        new_task.add_done_callback(self._background_tasks.discard)
+        new_task.add_done_callback(self._log_background_result)
+        new_task.add_done_callback(self._schedule_pending_rerun)
+        logger.debug(
+            f"[schedule_background] '{label}' pending rerun scheduled "
+            "after predecessor completed"
+        )
 
     # LLM confirmation for Trigger 2/3
     async def _llm_confirm_evolution(
