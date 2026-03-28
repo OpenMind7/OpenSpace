@@ -220,6 +220,8 @@ class SkillEvolver:
 
         # W6 Step 13: counter for periodic bandit decay (every 100 analyses).
         self._analysis_count: int = 0
+        # W8: flag to seed _analysis_count from persisted DB on first process_analysis call.
+        self._analysis_count_initialized: bool = False
 
     def set_available_tools(self, tools: List["BaseTool"]) -> None:
         """Update the tools available for evolution agent loops."""
@@ -301,6 +303,13 @@ class SkillEvolver:
             self._fine_tune_from_outcomes_bg(),
             label="fine_tune_embeddings",
         )
+
+        # W8: Seed _analysis_count from persistent store on first call so the
+        # decay trigger survives process restarts (counts carry over correctly).
+        if not self._analysis_count_initialized:
+            persisted = await asyncio.to_thread(self._store.get_analysis_count)
+            self._analysis_count = persisted
+            self._analysis_count_initialized = True
 
         # W6 Step 13: Periodic bandit decay — prevents exploration collapse.
         # Shrinks Beta posteriors toward Beta(1,1) every 100 analyses.

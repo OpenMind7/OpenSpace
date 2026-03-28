@@ -352,8 +352,9 @@ class SkillStore:
                     "ALTER TABLE skill_dispatch_events "
                     "ADD COLUMN bandit_snapshot TEXT NOT NULL DEFAULT '{}'"
                 )
-            except Exception:
-                pass  # column already exists
+            except Exception as e:
+                if "duplicate column" not in str(e).lower():
+                    logger.warning("bandit_snapshot migration failed: %s", e)
             self._conn.commit()
 
     # Lifecycle
@@ -984,6 +985,16 @@ class SkillStore:
             return [dict(r) for r in rows]
 
     @_db_retry()
+    def get_analysis_count(self) -> int:
+        """Return the total number of persisted execution analyses.
+
+        Used by SkillEvolver to seed _analysis_count on startup so that the
+        periodic bandit-decay trigger survives process restarts.
+        """
+        with self._reader() as conn:
+            return conn.execute("SELECT COUNT(*) FROM execution_analyses").fetchone()[0]
+
+    @_db_retry()
     def get_stats(self, *, active_only: bool = True) -> Dict[str, Any]:
         """Aggregate statistics across skills."""
         with self._reader() as conn:
@@ -1009,6 +1020,8 @@ class SkillStore:
             n_analyses = conn.execute(
                 "SELECT COUNT(*) FROM execution_analyses"
             ).fetchone()[0]
+            # Also exposed as a cheap standalone query (used by SkillEvolver to
+            # seed _analysis_count on first call so decay cadence survives restarts).
             n_candidates = conn.execute(
                 "SELECT COUNT(*) FROM execution_analyses "
                 "WHERE candidate_for_evolution=1"
@@ -1448,8 +1461,18 @@ class SkillStore:
         uncertainty so that exploration can resume.  Only affects skills that
         have been dispatched at least once.
 
+        Args:
+            decay_factor: Must be in [0.0, 1.0].  Values outside this range
+                raise ValueError because they push alpha/beta away from the
+                Beta(1,1) prior and can produce negative parameters.
+
         Returns the number of rows updated.
         """
+        import math
+        if not isinstance(decay_factor, (int, float)) or math.isnan(decay_factor) or math.isinf(decay_factor):
+            raise ValueError(f"decay_factor must be a finite float, got {decay_factor!r}")
+        if not (0.0 <= decay_factor <= 1.0):
+            raise ValueError(f"decay_factor must be in [0.0, 1.0], got {decay_factor}")
         return await asyncio.to_thread(self._decay_bandit_posteriors_sync, decay_factor)
 
     @_db_retry()

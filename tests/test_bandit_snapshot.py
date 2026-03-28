@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import math
 import tempfile
 from datetime import datetime
 from pathlib import Path
@@ -276,6 +277,7 @@ class TestEvolverDecayTrigger:
         try:
             evolver = make_evolver(store)
             evolver._analysis_count = 99  # one away from trigger
+            evolver._analysis_count_initialized = True  # skip DB seeding
 
             scheduled_labels = []
 
@@ -297,6 +299,7 @@ class TestEvolverDecayTrigger:
         try:
             evolver = make_evolver(store)
             evolver._analysis_count = 98  # two away from trigger
+            evolver._analysis_count_initialized = True  # skip DB seeding
 
             scheduled_labels = []
 
@@ -309,5 +312,71 @@ class TestEvolverDecayTrigger:
             evolver.schedule_background = mock_schedule
             await evolver.process_analysis(make_analysis())
             assert "bandit_decay" not in scheduled_labels
+        finally:
+            store.close()
+
+
+# ---------------------------------------------------------------------------
+# W8 — MEDIUM-1: decay_bandit_posteriors invalid decay_factor validation
+# ---------------------------------------------------------------------------
+
+class TestDecayFactorValidation:
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("bad_factor", [-1.0, -0.001, 2.0, 1.001,
+                                             float("nan"), float("inf"), float("-inf")])
+    async def test_invalid_decay_factor_raises(self, bad_factor: float):
+        store = make_temp_store()
+        try:
+            seed_bandit(store, "sk-x", alpha=5.0, beta=5.0)
+            with pytest.raises(ValueError):
+                await store.decay_bandit_posteriors(decay_factor=bad_factor)
+        finally:
+            store.close()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("good_factor", [0.0, 0.5, 0.99, 1.0])
+    async def test_valid_decay_factor_does_not_raise(self, good_factor: float):
+        store = make_temp_store()
+        try:
+            seed_bandit(store, "sk-y", alpha=5.0, beta=5.0)
+            await store.decay_bandit_posteriors(decay_factor=good_factor)  # no exception
+        finally:
+            store.close()
+
+
+# ---------------------------------------------------------------------------
+# W8 — LOW-2: bandit_snapshot tool_layer truncation test
+# ---------------------------------------------------------------------------
+
+class TestBanditSnapshotTruncation:
+    @pytest.mark.asyncio
+    async def test_snapshot_contains_only_selected_skills(self):
+        """Pool of 4 skills; 2 selected → stored snapshot has exactly 2 keys."""
+        store = make_temp_store()
+        try:
+            # Seed 4 skills in the bandit table (pool)
+            for sk in ["sk-a", "sk-b", "sk-c", "sk-d"]:
+                seed_bandit(store, sk, alpha=2.0, beta=2.0)
+
+            # Simulate tool_layer: pre-filter snapshot to selected subset only
+            selected = ["sk-b", "sk-d"]
+            full_stats = store.get_bandit_stats(["sk-a", "sk-b", "sk-c", "sk-d"])
+            truncated_snapshot = {
+                sk: {"alpha": full_stats[sk].alpha, "beta": full_stats[sk].beta}
+                for sk in selected
+            }
+
+            await store.record_dispatch_event(
+                task_id="trunc-test-1",
+                skill_ids=selected,
+                method="thompson_sampling",
+                bandit_snapshot=truncated_snapshot,
+            )
+
+            row = read_dispatch_row(store, "trunc-test-1")
+            stored = json.loads(row["bandit_snapshot"])
+            assert set(stored.keys()) == {"sk-b", "sk-d"}, (
+                f"Expected exactly 2 keys {{sk-b, sk-d}}, got {set(stored.keys())}"
+            )
         finally:
             store.close()
