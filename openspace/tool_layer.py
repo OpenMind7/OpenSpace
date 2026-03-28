@@ -468,6 +468,23 @@ class OpenSpace:
                         f"(budget: {max_iterations})"
                     )
 
+                    # HIGH-1: Record Phase 1 failure in TS posteriors immediately.
+                    # The overall task may succeed via Phase 2 fallback, but the
+                    # skill guidance itself failed — mark negative now so TS
+                    # posteriors aren't inflated by an eventual fallback success.
+                    if self._skill_store and injected_skill_ids:
+                        for _sid in injected_skill_ids:
+                            try:
+                                await self._skill_store.update_bandit(_sid, success=False)
+                            except Exception as _be:
+                                logger.debug(
+                                    "TS phase-1 bandit update failed (non-fatal): %s", _be
+                                )
+                        logger.debug(
+                            "[Phase 1] Recorded TS failure for %d skill(s): %s",
+                            len(injected_skill_ids), injected_skill_ids,
+                        )
+
                     # Clean up workspace artifacts created by the failed
                     # skill-guided phase so the fallback starts fresh.
                     if workspace_path:
