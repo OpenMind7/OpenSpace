@@ -108,7 +108,7 @@ class SkillMeta:
     description: str
     path: Path             # Absolute path to SKILL.md
     capabilities: frozenset[str] = frozenset()   # Declared capabilities from frontmatter
-    critical_tools: List[str] = field(default_factory=list)  # Must-have tool keys
+    critical_tools: tuple[str, ...] = ()  # Must-have tool keys (immutable)
 
 
 class SkillRegistry:
@@ -785,12 +785,13 @@ class SkillRegistry:
             # Check backend satisfaction: every declared capability must
             # map to at least one backend present in the session.
             if session_backends is not None:
-                required_backends: set[str] = set()
+                unsatisfied = False
                 for cap in s.capabilities:
                     cap_backends = CAPABILITY_TO_BACKENDS.get(cap)
-                    if cap_backends:
-                        required_backends.update(cap_backends)
-                if not required_backends.issubset(session_backends):
+                    if cap_backends and not (cap_backends & session_backends):
+                        unsatisfied = True
+                        break
+                if unsatisfied:
                     cap_filtered.append(s.skill_id)
                     continue
 
@@ -830,7 +831,7 @@ class SkillRegistry:
 
         # Parse critical_tools from frontmatter (comma-separated list)
         raw_ct = frontmatter.get("critical_tools", "")
-        critical_tools = [t.strip() for t in raw_ct.split(",") if t.strip()] if raw_ct else []
+        critical_tools = tuple(t.strip() for t in raw_ct.split(",") if t.strip()) if raw_ct else ()
 
         return SkillMeta(
             skill_id=skill_id,

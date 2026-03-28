@@ -202,7 +202,7 @@ class TestFilterByCapability:
         available = list(registry._skills.values())
         # Manually set critical_tools on the SkillMeta
         for s in available:
-            s.critical_tools = ["special_mcp_tool"]
+            s.critical_tools = ("special_mcp_tool",)
         filtered = registry._filter_by_capability(
             available,
             session_backends=frozenset({"mcp"}),
@@ -217,7 +217,7 @@ class TestFilterByCapability:
         ])
         available = list(registry._skills.values())
         for s in available:
-            s.critical_tools = ["special_mcp_tool"]
+            s.critical_tools = ("special_mcp_tool",)
         filtered = registry._filter_by_capability(
             available,
             session_backends=frozenset({"mcp"}),

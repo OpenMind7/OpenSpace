@@ -16,8 +16,11 @@ Design principles:
 from __future__ import annotations
 
 import ast
+import logging
 import re
 from typing import Dict, List, Optional
+
+logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
@@ -46,6 +49,9 @@ _DANGEROUS_EXFIL_MODULES: frozenset[str] = frozenset({
 
 # All modules considered dangerous (union for general checks)
 _ALL_DANGEROUS_MODULES: frozenset[str] = _DANGEROUS_EXEC_MODULES | _DANGEROUS_EXFIL_MODULES
+
+# Modules where ANY call is dangerous (promoted from inline set — H2 fix)
+_ANY_CALL_BLOCKED_MODULES: frozenset[str] = frozenset({"ctypes", "pty", "commands"})
 
 _DANGEROUS_OS_FUNCS: frozenset[str] = frozenset({
     "system", "popen", "popen2", "popen3", "popen4",
@@ -86,7 +92,7 @@ _BLANKET_BLOCKED_BUILTINS: frozenset[str] = frozenset({
 
 # Fenced code blocks: ```python or ```py
 _PYTHON_FENCE_RE = re.compile(
-    r"```(?:python|py)\s*\n(.*?)```",
+    r"```(?:python|py)\s*\r?\n(.*?)```",
     re.DOTALL,
 )
 
@@ -241,9 +247,8 @@ class DangerousNodeVisitor(ast.NodeVisitor):
             return
 
         # ctypes / pty / commands — any call on these modules (or submodules) is dangerous
-        _any_call_blocked = {"ctypes", "pty", "commands"}
-        if module_part in _any_call_blocked or any(
-            module_part.startswith(m + ".") for m in _any_call_blocked
+        if module_part in _ANY_CALL_BLOCKED_MODULES or any(
+            module_part.startswith(m + ".") for m in _ANY_CALL_BLOCKED_MODULES
         ):
             self.flags.append("blocked.shell_injection")
             return
@@ -279,7 +284,10 @@ class DangerousNodeVisitor(ast.NodeVisitor):
             attr_arg = _get_constant_arg(node, 1)
             if attr_arg is None:
                 # Dynamic attr on dangerous module — fail-closed
-                self.flags.append("blocked.shell_injection")
+                flag = ("blocked.credential_exfil"
+                        if resolved_mod in _DANGEROUS_EXFIL_MODULES
+                        else "blocked.shell_injection")
+                self.flags.append(flag)
             elif resolved_mod == "os" and attr_arg in _DANGEROUS_OS_FUNCS:
                 self.flags.append("blocked.shell_injection")
             elif resolved_mod == "subprocess" and attr_arg in _DANGEROUS_SUBPROCESS_FUNCS:
@@ -369,15 +377,15 @@ def check_ast_safety(source: str) -> List[str]:
     """
     try:
         tree = ast.parse(source)
-    except SyntaxError:
+    except SyntaxError as exc:
+        logger.warning("AST parse failed (falling through to regex): %s", exc)
         return []
 
     visitor = DangerousNodeVisitor()
     visitor.visit(tree)
 
     # Deduplicate while preserving order
-    seen: set[str] = set()
-    return [f for f in visitor.flags if not (f in seen or seen.add(f))]  # type: ignore[func-returns-value]
+    return list(dict.fromkeys(visitor.flags))
 
 
 def check_python_blocks_safety(text: str) -> List[str]:

@@ -79,8 +79,7 @@ def check_skill_safety(text: str) -> List[str]:
     ast_flags = check_python_blocks_safety(text)
     regex_flags = [flag for flag, pat in _SAFETY_RULES if pat.search(text)]
     # merge + dedup, AST first (AST is more precise)
-    seen: set[str] = set()
-    return [f for f in (ast_flags + regex_flags) if not (f in seen or seen.add(f))]
+    return list(dict.fromkeys(ast_flags + regex_flags))
 
 
 def check_skill_directory_safety(skill_dir: Path) -> List[str]:
@@ -111,8 +110,7 @@ def check_skill_directory_safety(skill_dir: Path) -> List[str]:
         all_flags.append("blocked.unreadable_directory")
 
     # Deduplicate while preserving first-occurrence order.
-    seen: Set[str] = set()
-    return [f for f in all_flags if not (f in seen or seen.add(f))]  # type: ignore[func-returns-value]
+    return list(dict.fromkeys(all_flags))
 
 
 def is_skill_safe(flags: List[str]) -> bool:
