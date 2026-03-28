@@ -327,8 +327,8 @@ class SkillRegistry:
 
             meta = self._parse_skill(skill_dir.name, skill_dir, skill_file, content)
             if meta.skill_id in self._skills:
-                logger.debug(f"register_skill_dir: {meta.skill_id} already exists")
-                return None
+                logger.debug(f"register_skill_dir: {meta.skill_id} already exists, returning existing")
+                return self._skills[meta.skill_id]
             self._skills[meta.skill_id] = meta
             self._content_cache[meta.skill_id] = content
             logger.info(f"Hot-registered skill: {meta.skill_id}")

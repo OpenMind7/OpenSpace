@@ -653,7 +653,7 @@ class LLMClient:
                 except:
                     pass
                 
-                if tool_name not in tool_map:
+                if tool_obj is None:
                     result = ToolResult(
                         status=ToolStatus.ERROR,
                         error=f"Tool '{tool_name}' not found"
@@ -661,7 +661,7 @@ class LLMClient:
                 else:
                     try:
                         result = await _execute_tool_call(
-                            tool=tool_map[tool_name],
+                            tool=tool_obj,
                             openai_tool_call={
                                 "id": tool_call.id,
                                 "type": "function",

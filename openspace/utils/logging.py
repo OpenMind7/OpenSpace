@@ -241,6 +241,14 @@ class Logger:
         cls._update_level(cls._resolve_level(None))
 
     @classmethod
+    def set_level(cls, level_name: str) -> None:
+        """Set log level by name (DEBUG, INFO, WARNING, ERROR, CRITICAL)."""
+        level = getattr(logging, level_name.upper(), None)
+        if level is None:
+            raise ValueError(f"Unknown log level: {level_name!r}")
+        cls._update_level(level)
+
+    @classmethod
     def add_file_handler(
         cls, 
         filepath: str, 

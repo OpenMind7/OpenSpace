@@ -337,13 +337,13 @@ class GroundingClient:
     def get_session_info(self, name: str) -> SessionInfo:
         """Get session monitoring info"""
         if name not in self._session_info:
-            raise ErrorCode.SESSION_NOT_FOUND(name)
+            raise GroundingError(f"Session not found: {name}", code=ErrorCode.SESSION_NOT_FOUND)
         return self._session_info[name]
-    
+
     def get_session(self, name: str) -> BaseSession:
         """Get session"""
         if name not in self._sessions:
-            raise ErrorCode.SESSION_NOT_FOUND(name)
+            raise GroundingError(f"Session not found: {name}", code=ErrorCode.SESSION_NOT_FOUND)
         return self._sessions[name]
     
     
@@ -477,9 +477,9 @@ class GroundingClient:
             List of tools
         """
         # Session-level
-        if session_name:                  
+        if session_name:
             if session_name not in self._sessions:
-                raise ErrorCode.SESSION_NOT_FOUND(session_name)
+                raise GroundingError(f"Session not found: {session_name}", code=ErrorCode.SESSION_NOT_FOUND)
             backend_type = self._session_info[session_name].backend_type
             return await self._fetch_tools(
                 backend_type,
@@ -531,7 +531,7 @@ class GroundingClient:
         use_cache: bool = False
     ) -> list[BaseTool]:
         if session_name not in self._session_info:
-            raise ErrorCode.SESSION_NOT_FOUND(session_name)
+            raise GroundingError(f"Session not found: {session_name}", code=ErrorCode.SESSION_NOT_FOUND)
         backend = self._session_info[session_name].backend_type
         return await self.list_tools(backend, session_name, use_cache)
 
@@ -838,7 +838,7 @@ class GroundingClient:
                     runtime_backend = backend
                 else:
                     if runtime_session not in self._session_info:
-                        raise ErrorCode.SESSION_NOT_FOUND(runtime_session)
+                        raise GroundingError(f"Session not found: {runtime_session}", code=ErrorCode.SESSION_NOT_FOUND)
                     runtime_backend = self._session_info[
                         runtime_session
                     ].backend_type
