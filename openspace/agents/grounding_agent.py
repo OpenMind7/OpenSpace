@@ -65,6 +65,7 @@ class GroundingAgent(BaseAgent):
         # Skill context injection (set externally before process())
         self._skill_context: Optional[str] = None
         self._active_skill_ids: List[str] = []
+        self._skill_capabilities: frozenset[str] = frozenset()
 
         # Skill registry for mid-iteration retrieve_skill tool
         self._skill_registry: Optional["SkillRegistry"] = None
@@ -85,6 +86,7 @@ class GroundingAgent(BaseAgent):
         self,
         context: str,
         skill_ids: Optional[List[str]] = None,
+        skill_capabilities: Optional[frozenset[str]] = None,
     ) -> None:
         """Inject skill guidance into the agent's system prompt.
 
@@ -95,9 +97,11 @@ class GroundingAgent(BaseAgent):
         Args:
             context: Formatted skill content for system prompt injection.
             skill_ids: skill_id values of injected skills.
+            skill_capabilities: Union of all injected skills' capabilities.
         """
         self._skill_context = context if context else None
         self._active_skill_ids = skill_ids or []
+        self._skill_capabilities = skill_capabilities or frozenset()
         if self._skill_context:
             logger.info(f"Skill context set: {', '.join(self._active_skill_ids) or '(unnamed)'}")
 
@@ -107,6 +111,7 @@ class GroundingAgent(BaseAgent):
             logger.info(f"Skill context cleared (was: {', '.join(self._active_skill_ids)})")
         self._skill_context = None
         self._active_skill_ids = []
+        self._skill_capabilities = frozenset()
 
     @property
     def has_skill_context(self) -> bool:
@@ -551,13 +556,16 @@ class GroundingAgent(BaseAgent):
 
         backends = [BackendType(name) for name in self._backend_scope]
 
-        # Ensure shell backend is available when skills are active
-        # (skills commonly reference shell_agent, read_file, etc.)
+        # Ensure shell backend is available when skills need it.
+        # Legacy skills (no capabilities) get shell (fail-open).
+        # Skills declaring only network/cloud_api skip shell auto-add.
         if self.has_skill_context:
-            shell_bt = BackendType.SHELL
-            if shell_bt not in backends:
-                backends = list(backends) + [shell_bt]
-                logger.info("Added Shell backend to scope for skill file I/O")
+            from openspace.skill_engine.skill_utils import capabilities_need_shell
+            if capabilities_need_shell(self._skill_capabilities):
+                shell_bt = BackendType.SHELL
+                if shell_bt not in backends:
+                    backends = list(backends) + [shell_bt]
+                    logger.info("Added Shell backend to scope for skill capabilities")
 
         try:
             retrieval_llm = self._tool_retrieval_llm or self._llm_client

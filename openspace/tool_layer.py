@@ -710,6 +710,11 @@ class OpenSpace:
         # candidates; final truncation to max_select happens inside ts_blend_reorder.
         ts_pool_size = max(max_select * 3, 5)
 
+        # Gather session backends for capability filtering
+        agent_backends_set: Optional[frozenset[str]] = None
+        if self._grounding_agent and self._grounding_agent.backend_scope:
+            agent_backends_set = frozenset(self._grounding_agent.backend_scope)
+
         if skill_llm:
             selected, selection_record = await self._skill_registry.select_skills_with_llm(
                 task,
@@ -717,6 +722,7 @@ class OpenSpace:
                 max_skills=ts_pool_size,
                 skill_quality=skill_quality,
                 store=self._skill_store,
+                session_backends=agent_backends_set,
             )
         else:
             # No LLM client — use local prefilter (BM25+embedding, Stage 3 if enabled)
@@ -780,7 +786,9 @@ class OpenSpace:
         agent_backends = self._grounding_agent.backend_scope if self._grounding_agent else None
         context_text = self._skill_registry.build_context_injection(selected, backends=agent_backends)
         skill_ids = [s.skill_id for s in selected]
-        self._grounding_agent.set_skill_context(context_text, skill_ids)
+        # Collect union of all selected skills' capabilities
+        all_caps: frozenset[str] = frozenset().union(*(s.capabilities for s in selected))
+        self._grounding_agent.set_skill_context(context_text, skill_ids, skill_capabilities=all_caps)
         logger.info(f"Injected {len(selected)} active skill(s): {skill_ids}")
 
         # MEDIUM-5: Persist dispatch event regardless of recording state.

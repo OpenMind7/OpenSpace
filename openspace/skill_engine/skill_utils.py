@@ -70,9 +70,17 @@ _BLOCKING_FLAGS = frozenset({
 def check_skill_safety(text: str) -> List[str]:
     """Check *text* against safety rules, return list of triggered flag names.
 
-    Returns an empty list if no rules match (= safe).
+    Uses AST-based analysis for Python code blocks (catches evasion vectors
+    like alias tracking, dynamic imports, attribute chains) plus regex rules
+    for non-Python content.  Returns an empty list if no rules match (= safe).
     """
-    return [flag for flag, pat in _SAFETY_RULES if pat.search(text)]
+    from .ast_safety import check_python_blocks_safety
+
+    ast_flags = check_python_blocks_safety(text)
+    regex_flags = [flag for flag, pat in _SAFETY_RULES if pat.search(text)]
+    # merge + dedup, AST first (AST is more precise)
+    seen: set[str] = set()
+    return [f for f in (ast_flags + regex_flags) if not (f in seen or seen.add(f))]
 
 
 def check_skill_directory_safety(skill_dir: Path) -> List[str]:
@@ -442,4 +450,33 @@ def check_capability_violations(
                 f"Uses {cap} APIs but '{cap}' capability not declared in manifest"
             )
     return violations
+
+
+# ---------------------------------------------------------------------------
+# Capability-to-Backend mapping (Gate Patch 5 — Phase 2)
+# ---------------------------------------------------------------------------
+
+CAPABILITY_TO_BACKENDS: Dict[str, frozenset[str]] = {
+    "network":    frozenset({"mcp"}),
+    "filesystem": frozenset({"shell", "mcp"}),
+    "subprocess": frozenset({"shell"}),
+    "env_vars":   frozenset({"shell"}),
+    "cloud_api":  frozenset({"mcp"}),
+    "gpu":        frozenset({"shell", "mcp"}),
+}
+
+# Capabilities that require the shell backend to be auto-added.
+_SHELL_REQUIRING_CAPABILITIES = frozenset({"filesystem", "subprocess", "env_vars", "gpu"})
+
+
+def capabilities_need_shell(capabilities: frozenset[str]) -> bool:
+    """Return True if *capabilities* require the shell backend.
+
+    Fail-open: empty capabilities (legacy skills) return True so that
+    existing skills continue to work.  Only explicit network-only or
+    cloud_api-only skills skip shell auto-add.
+    """
+    if not capabilities:
+        return True  # legacy / no manifest → fail-open
+    return bool(capabilities & _SHELL_REQUIRING_CAPABILITIES)
 

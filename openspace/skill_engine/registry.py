@@ -24,12 +24,14 @@ from __future__ import annotations
 import json
 import re
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional, TYPE_CHECKING
 
 from openspace.utils.logging import Logger
 from .skill_utils import (
+    CAPABILITY_TO_BACKENDS,
+    parse_capabilities,
     parse_frontmatter,
     strip_frontmatter,
     check_skill_safety,
@@ -105,6 +107,8 @@ class SkillMeta:
     name: str              # Human-readable name (from frontmatter or dirname)
     description: str
     path: Path             # Absolute path to SKILL.md
+    capabilities: frozenset[str] = frozenset()   # Declared capabilities from frontmatter
+    critical_tools: List[str] = field(default_factory=list)  # Must-have tool keys
 
 
 class SkillRegistry:
@@ -365,6 +369,8 @@ class SkillRegistry:
         model: Optional[str] = None,
         skill_quality: Optional[Dict[str, Dict[str, Any]]] = None,
         store: Optional["SkillStore"] = None,
+        session_tool_names: Optional[frozenset[str]] = None,
+        session_backends: Optional[frozenset[str]] = None,
     ) -> tuple[List[SkillMeta], Optional[Dict[str, Any]]]:
         """Use an LLM to select the most relevant skills.
 
@@ -428,6 +434,17 @@ class SkillRegistry:
                     f"severely broken skill(s): {filtered_out}"
                 )
             available = kept
+
+        if not available:
+            return [], None
+
+        # Capability-based filtering: remove skills whose declared capabilities
+        # cannot be satisfied by the current session's backends/tools.
+        available = self._filter_by_capability(
+            available,
+            session_backends=session_backends,
+            session_tool_names=session_tool_names,
+        )
 
         if not available:
             return [], None
@@ -743,6 +760,55 @@ class SkillRegistry:
         if not self._discovered:
             self.discover()
 
+    def _filter_by_capability(
+        self,
+        skills: List[SkillMeta],
+        session_backends: Optional[frozenset[str]] = None,
+        session_tool_names: Optional[frozenset[str]] = None,
+    ) -> List[SkillMeta]:
+        """Filter skills whose capabilities can't be satisfied by the session.
+
+        Fail-open: skills with no declared capabilities pass unconditionally.
+        When ``session_backends`` is None (unknown), all skills pass.
+        """
+        if session_backends is None and session_tool_names is None:
+            return skills  # nothing to check — pass all
+
+        kept: List[SkillMeta] = []
+        cap_filtered: List[str] = []
+        for s in skills:
+            # No capabilities → legacy, pass (fail-open)
+            if not s.capabilities:
+                kept.append(s)
+                continue
+
+            # Check backend satisfaction: every declared capability must
+            # map to at least one backend present in the session.
+            if session_backends is not None:
+                required_backends: set[str] = set()
+                for cap in s.capabilities:
+                    cap_backends = CAPABILITY_TO_BACKENDS.get(cap)
+                    if cap_backends:
+                        required_backends.update(cap_backends)
+                if not required_backends.issubset(session_backends):
+                    cap_filtered.append(s.skill_id)
+                    continue
+
+            # Check critical_tools satisfaction
+            if session_tool_names is not None and s.critical_tools:
+                if not frozenset(s.critical_tools).issubset(session_tool_names):
+                    cap_filtered.append(s.skill_id)
+                    continue
+
+            kept.append(s)
+
+        if cap_filtered:
+            logger.info(
+                f"Capability filter: removed {len(cap_filtered)} skill(s) "
+                f"with unsatisfied capabilities: {cap_filtered}"
+            )
+        return kept
+
     @staticmethod
     def _parse_skill(
         dir_name: str,
@@ -760,12 +826,19 @@ class SkillRegistry:
         name = frontmatter.get("name", dir_name)
         description = frontmatter.get("description", name)
         skill_id = _read_or_create_skill_id(name, skill_dir)
+        capabilities = parse_capabilities(content)
+
+        # Parse critical_tools from frontmatter (comma-separated list)
+        raw_ct = frontmatter.get("critical_tools", "")
+        critical_tools = [t.strip() for t in raw_ct.split(",") if t.strip()] if raw_ct else []
 
         return SkillMeta(
             skill_id=skill_id,
             name=name,
             description=description,
             path=skill_file,
+            capabilities=capabilities,
+            critical_tools=critical_tools,
         )
 
     # Frontmatter parsing is delegated to skill_utils (single source of truth).
