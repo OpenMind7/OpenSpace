@@ -177,6 +177,15 @@ CREATE TABLE IF NOT EXISTS failure_lessons (
 );
 CREATE INDEX IF NOT EXISTS idx_fl_task    ON failure_lessons(task_id);
 CREATE INDEX IF NOT EXISTS idx_fl_created ON failure_lessons(created_at);
+
+CREATE TABLE IF NOT EXISTS skill_bandit (
+    skill_id         TEXT    PRIMARY KEY,
+    alpha            REAL    NOT NULL DEFAULT 1.0,
+    beta             REAL    NOT NULL DEFAULT 1.0,
+    prior_confidence REAL    NOT NULL DEFAULT 0.5,
+    total_dispatches INTEGER NOT NULL DEFAULT 0,
+    last_updated     TEXT    NOT NULL
+);
 """
 
 
@@ -1251,6 +1260,70 @@ class SkillStore:
             )
             self._conn.commit()
             return cur.rowcount
+
+    # --- Thompson Sampling Bandit ---
+
+    def get_bandit_stats(
+        self, skill_ids: List[str]
+    ) -> Dict[str, "SkillBanditStats"]:
+        """Return bandit stats for *skill_ids*.  Missing skills get default Beta(1,1).
+
+        Sync read — safe to call from async context via asyncio.to_thread if needed,
+        but fast enough for inline use during selection (single indexed query).
+        """
+        from openspace.skill_engine.types import SkillBanditStats
+        if not skill_ids:
+            return {}
+        placeholders = ",".join("?" * len(skill_ids))
+        with self._reader() as conn:
+            rows = conn.execute(
+                f"SELECT skill_id, alpha, beta, prior_confidence, total_dispatches, "
+                f"last_updated FROM skill_bandit WHERE skill_id IN ({placeholders})",
+                skill_ids,
+            ).fetchall()
+        result: Dict[str, SkillBanditStats] = {
+            r["skill_id"]: SkillBanditStats(
+                skill_id=r["skill_id"],
+                alpha=float(r["alpha"]),
+                beta=float(r["beta"]),
+                prior_confidence=float(r["prior_confidence"]),
+                total_dispatches=int(r["total_dispatches"]),
+                last_updated=datetime.fromisoformat(r["last_updated"]),
+            )
+            for r in rows
+        }
+        # Fill missing entries with cold-start Beta(1, 1)
+        for sid in skill_ids:
+            if sid not in result:
+                result[sid] = SkillBanditStats(skill_id=sid)
+        return result
+
+    async def update_bandit(self, skill_id: str, *, success: bool) -> None:
+        """Increment alpha (success) or beta (failure) for one skill."""
+        await asyncio.to_thread(self._update_bandit_sync, skill_id, success)
+
+    @_db_retry()
+    def _update_bandit_sync(self, skill_id: str, success: bool) -> None:
+        alpha_delta = 1.0 if success else 0.0
+        beta_delta = 0.0 if success else 1.0
+        now_iso = datetime.now().isoformat()
+        with self._mu:
+            # Ensure row exists (no-op if already present)
+            self._conn.execute(
+                "INSERT OR IGNORE INTO skill_bandit "
+                "(skill_id, alpha, beta, prior_confidence, total_dispatches, last_updated) "
+                "VALUES (?, 1.0, 1.0, 0.5, 0, ?)",
+                (skill_id, now_iso),
+            )
+            # Apply the outcome delta
+            self._conn.execute(
+                "UPDATE skill_bandit SET "
+                "alpha = alpha + ?, beta = beta + ?, "
+                "total_dispatches = total_dispatches + 1, last_updated = ? "
+                "WHERE skill_id = ?",
+                (alpha_delta, beta_delta, now_iso, skill_id),
+            )
+            self._conn.commit()
 
     # Maintenance
     def clear(self) -> None:

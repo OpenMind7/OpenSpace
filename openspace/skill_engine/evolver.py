@@ -286,6 +286,13 @@ class SkillEvolver:
                 label=f"distill_failure:{analysis.task_id}",
             )
 
+        # W6-P1: Update Thompson Sampling bandits (background, non-blocking)
+        if analysis.skill_judgments:
+            self.schedule_background(
+                self._update_bandits_bg(analysis),
+                label=f"bandit_update:{analysis.task_id}",
+            )
+
         if not analysis.candidate_for_evolution:
             return []
 
@@ -316,6 +323,15 @@ class SkillEvolver:
                 await self._distill_failure(analysis)
         except Exception as e:
             logger.debug("Failure distillation failed (non-fatal): %s", e)
+
+    async def _update_bandits_bg(self, analysis: ExecutionAnalysis) -> None:
+        """W6-P1: Background task — update TS bandit alpha/beta for each skill judgment."""
+        success = analysis.task_completed
+        for judgment in analysis.skill_judgments:
+            try:
+                await self._store.update_bandit(judgment.skill_id, success=success)
+            except Exception as exc:
+                logger.debug("Bandit update failed for %s: %s", judgment.skill_id, exc)
 
     async def _distill_failure(self, analysis: ExecutionAnalysis) -> None:
         """Distill a FailureLesson from a failed task execution.

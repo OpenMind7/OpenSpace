@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import random
 from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
@@ -383,6 +384,66 @@ class FailureLesson:
                 if data.get("created_at") else datetime.now()
             ),
             expires_at=expires,
+        )
+
+
+@dataclass
+class SkillBanditStats:
+    """Thompson Sampling bandit state for one skill.
+
+    Models dispatch quality as Beta(alpha, beta).  At selection time,
+    ``sample()`` draws from this posterior — higher samples rank the skill
+    higher, creating exploration/exploitation balance.
+
+    Prior seeding: alpha/beta may be initialised from semantic similarity
+    to existing high-performing skills so cold-start skills are not
+    penalised too early.
+    """
+
+    skill_id: str
+    alpha: float = 1.0          # successes + 1  (Beta parameter a)
+    beta: float = 1.0           # failures  + 1  (Beta parameter b)
+    prior_confidence: float = 0.5   # 0=cold-start, 1=seeded from similar skill
+    total_dispatches: int = 0
+    last_updated: datetime = field(default_factory=datetime.now)
+
+    def sample(self) -> float:
+        """Draw a sample from Beta(alpha, beta) via random.betavariate."""
+        return random.betavariate(max(self.alpha, 1e-6), max(self.beta, 1e-6))
+
+    def updated(self, *, success: bool) -> "SkillBanditStats":
+        """Return a NEW SkillBanditStats with alpha or beta incremented (immutable)."""
+        return SkillBanditStats(
+            skill_id=self.skill_id,
+            alpha=self.alpha + (1.0 if success else 0.0),
+            beta=self.beta + (0.0 if success else 1.0),
+            prior_confidence=self.prior_confidence,
+            total_dispatches=self.total_dispatches + 1,
+            last_updated=datetime.now(),
+        )
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "skill_id": self.skill_id,
+            "alpha": self.alpha,
+            "beta": self.beta,
+            "prior_confidence": self.prior_confidence,
+            "total_dispatches": self.total_dispatches,
+            "last_updated": self.last_updated.isoformat(),
+        }
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "SkillBanditStats":
+        return cls(
+            skill_id=data["skill_id"],
+            alpha=float(data.get("alpha", 1.0)),
+            beta=float(data.get("beta", 1.0)),
+            prior_confidence=float(data.get("prior_confidence", 0.5)),
+            total_dispatches=int(data.get("total_dispatches", 0)),
+            last_updated=(
+                datetime.fromisoformat(data["last_updated"])
+                if data.get("last_updated") else datetime.now()
+            ),
         )
 
 

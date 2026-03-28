@@ -705,6 +705,16 @@ class OpenSpace:
                 "selected": [s.skill_id for s in selected],
             }
 
+        # W6-P1: Thompson Sampling blend — reorder by TS posterior + hybrid score
+        if self._skill_store and selected:
+            try:
+                bandit_stats = self._skill_store.get_bandit_stats(
+                    [s.skill_id for s in selected]
+                )
+                selected = self._skill_registry.ts_blend_reorder(selected, bandit_stats)
+            except Exception as _ts_exc:
+                logger.debug("TS blend failed — using hybrid order: %s", _ts_exc)
+
         # Record skill selection to metadata.json
         if self._recording_manager and selection_record:
             # Add model info to the record

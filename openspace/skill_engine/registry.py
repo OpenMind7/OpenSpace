@@ -35,6 +35,7 @@ from .skill_ranker import SkillRanker, SkillCandidate, PREFILTER_THRESHOLD
 if TYPE_CHECKING:
     from openspace.llm import LLMClient
     from openspace.skill_engine.store import SkillStore
+    from openspace.skill_engine.types import SkillBanditStats
 
 logger = Logger.get_logger(__name__)
 
@@ -588,6 +589,38 @@ class SkillRegistry:
         if not available:
             return []
         return self._prefilter_skills(task_description, available, max_skills)[:max_skills]
+
+    def ts_blend_reorder(
+        self,
+        candidates: List[SkillMeta],
+        bandit_stats: Dict[str, "SkillBanditStats"],
+        *,
+        ts_weight: float = 0.25,
+    ) -> List[SkillMeta]:
+        """Reorder *candidates* by blending Thompson Sampling with hybrid rank.
+
+        Hybrid position score: linear decay from rank (1st → 1.0, last → 0.0).
+        TS score: Beta(alpha, beta) sample — exploration/exploitation draw.
+        Final = (1 - ts_weight) * hybrid_score + ts_weight * ts_sample
+
+        ts_weight=0.25 keeps the hybrid signal dominant (0.75 weight) while
+        allowing bandit exploration to influence ordering.  Falls back to
+        original order when bandit_stats is empty or an error occurs.
+        """
+        if not bandit_stats or not candidates:
+            return candidates
+
+        n = len(candidates)
+        blended: List[tuple] = []
+        for rank, skill in enumerate(candidates):
+            hybrid_score = 1.0 - rank / n
+            stats = bandit_stats.get(skill.skill_id)
+            ts_score = stats.sample() if stats else 0.5  # neutral default if missing
+            score = (1.0 - ts_weight) * hybrid_score + ts_weight * ts_score
+            blended.append((score, skill))
+
+        blended.sort(key=lambda x: x[0], reverse=True)
+        return [skill for _, skill in blended]
 
     def load_skill_content(self, skill_id: str) -> Optional[str]:
         """Return the SKILL.md content (with frontmatter stripped) for *skill_id*."""
