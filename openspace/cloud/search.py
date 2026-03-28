@@ -2,10 +2,15 @@
 
 Implements the search pipeline:
   Phase 0: nexus-kb FTS5 search (knowledge base cross-validation)
-  Phase 1: BM25 rough-rank over all candidates
+  Phase 1: BM25 rough-rank over all candidates (with query expansion + body content)
   Phase 2: Vector scoring (embedding cosine similarity)
-  Phase 3: Hybrid score = vector_score + lexical_boost + nexus_boost
+  Phase 3: RRF fusion (BM25 rank + vector rank) + lexical + nexus boosts
   Phase 4: Deduplication + limit
+
+Wave 2 upgrades (2026-03-28):
+  - BM25 body fix: SKILL.md body content included in BM25 ranking
+  - RRF fusion: Reciprocal Rank Fusion replaces simple score addition
+  - Query expansion: static synonym expansion before BM25 phase
 
 Used by MCP ``search_skills`` tool, ``retrieve_skill`` agent tool,
 and potentially other search interfaces.
@@ -22,6 +27,65 @@ logger = logging.getLogger("openspace.cloud")
 
 # Cross-validation boost when a skill matches nexus-kb keywords.
 _NEXUS_KB_CROSS_VALIDATION_BOOST = 0.2
+
+# RRF constant k (standard value; higher k = less aggressive rank weighting).
+_RRF_K = 60
+
+# Static synonym expansion table for common tech/automation concepts.
+# Keys are query tokens; values are additional tokens added to the BM25 query.
+_QUERY_SYNONYMS: dict[str, list[str]] = {
+    # File/dir operations
+    "list":      ["enumerate", "directory", "ls", "show", "get"],
+    "read":      ["load", "open", "parse", "fetch", "retrieve"],
+    "write":     ["save", "store", "create", "output", "dump"],
+    "delete":    ["remove", "rm", "unlink", "erase", "cleanup"],
+    "search":    ["find", "grep", "query", "lookup", "scan"],
+    "copy":      ["cp", "duplicate", "clone"],
+    "move":      ["mv", "rename", "transfer"],
+    # Web / network
+    "download":  ["fetch", "pull", "get", "http", "request"],
+    "upload":    ["push", "send", "post", "transfer"],
+    "scrape":    ["crawl", "extract", "parse", "harvest"],
+    "request":   ["http", "get", "post", "api", "call"],
+    # Code / dev
+    "run":       ["execute", "invoke", "call", "exec", "launch"],
+    "test":      ["check", "verify", "validate", "assert", "spec"],
+    "debug":     ["trace", "diagnose", "inspect", "troubleshoot"],
+    "build":     ["compile", "make", "bundle", "package"],
+    "deploy":    ["publish", "release", "ship", "push"],
+    "install":   ["setup", "configure", "add", "package"],
+    # Data
+    "parse":     ["decode", "extract", "process", "interpret"],
+    "format":    ["convert", "transform", "serialize", "render"],
+    "summarize": ["summarise", "condense", "synopsis", "brief"],
+    "analyze":   ["analyse", "review", "inspect", "evaluate"],
+    "generate":  ["create", "produce", "make", "write", "synthesize"],
+    # AI/ML
+    "embed":     ["embedding", "vector", "encode"],
+    "classify":  ["categorize", "label", "detect", "identify"],
+    "predict":   ["infer", "forecast", "estimate"],
+}
+
+
+def _expand_query(query: str) -> str:
+    """Expand query with synonyms for BM25 phase.
+
+    Appends synonym tokens for known tech terms so that skills matching
+    related vocabulary are not dropped in the BM25 pre-filter.
+    Original query tokens are preserved; expansion only adds extras.
+
+    Example:
+        "list files in directory" → "list enumerate directory ls show files ..."
+    """
+    tokens = _WORD_RE.findall(query.lower())
+    expansions: list[str] = []
+    for tok in tokens:
+        syns = _QUERY_SYNONYMS.get(tok)
+        if syns:
+            expansions.extend(syns)
+    if not expansions:
+        return query
+    return query + " " + " ".join(expansions)
 
 
 def _check_safety(text: str) -> list[str]:
@@ -118,12 +182,13 @@ class SkillSearchEngine:
         if not query_tokens:
             return []
 
-        # Phase 1: BM25 rough-rank
-        filtered = self._bm25_phase(q, candidates, limit)
+        # Phase 1: BM25 rough-rank (query-expanded, body-aware)
+        filtered, bm25_rank_map = self._bm25_phase(q, candidates, limit)
 
-        # Phase 2+3: Vector + lexical + nexus-kb cross-validation scoring
+        # Phase 2+3: RRF fusion (vector rank + BM25 rank) + lexical + nexus boosts
         scored = self._score_phase(
-            filtered, query_tokens, query_embedding, nexus_kb_keywords
+            filtered, query_tokens, query_embedding, nexus_kb_keywords,
+            bm25_rank_map=bm25_rank_map,
         )
 
         # Phase 4: Deduplicate and limit
@@ -134,9 +199,21 @@ class SkillSearchEngine:
         query: str,
         candidates: List[Dict[str, Any]],
         limit: int,
-    ) -> List[Dict[str, Any]]:
-        """BM25 rough-rank to keep top candidates for embedding stage."""
+    ) -> tuple[List[Dict[str, Any]], Dict[str, int]]:
+        """BM25 rough-rank to keep top candidates for embedding stage.
+
+        Wave 2 changes:
+          - Query is expanded with synonyms before BM25 (improves recall)
+          - SkillCandidate body is populated from ``_body`` / ``_embedding_text``
+            so skills matching only in SKILL.md body are no longer dropped
+          - Returns a bm25_rank_map {skill_id: rank} for RRF fusion
+
+        Returns:
+            (filtered_candidates, bm25_rank_map)
+        """
         from openspace.skill_engine.skill_ranker import SkillRanker, SkillCandidate
+
+        expanded_query = _expand_query(query)
 
         ranker = SkillRanker(enable_cache=True)
         bm25_candidates = [
@@ -144,18 +221,26 @@ class SkillSearchEngine:
                 skill_id=c.get("skill_id", ""),
                 name=c.get("name", ""),
                 description=c.get("description", ""),
-                body="",
+                # Use SKILL.md body content; fall back to embedding_text (covers all text)
+                body=c.get("_body", c.get("_embedding_text", "")),
                 metadata=c,
             )
             for c in candidates
         ]
-        ranked = ranker.bm25_only(query, bm25_candidates, top_k=min(limit * 3, len(candidates)))
+        ranked = ranker.bm25_only(
+            expanded_query, bm25_candidates,
+            top_k=min(limit * 3, len(candidates)),
+        )
 
-        ranked_ids = {sc.skill_id for sc in ranked}
+        # Preserve BM25 ranking order for RRF fusion
+        bm25_rank_map: Dict[str, int] = {sc.skill_id: rank for rank, sc in enumerate(ranked)}
+        ranked_ids = set(bm25_rank_map.keys())
         filtered = [c for c in candidates if c.get("skill_id") in ranked_ids]
 
-        # If BM25 found nothing, fall back to all candidates
-        return filtered if filtered else candidates
+        # If BM25 found nothing, fall back to all candidates (unranked → rank = index)
+        if not filtered:
+            return candidates, {c.get("skill_id", ""): i for i, c in enumerate(candidates)}
+        return filtered, bm25_rank_map
 
     def _score_phase(
         self,
@@ -163,49 +248,88 @@ class SkillSearchEngine:
         query_tokens: list[str],
         query_embedding: Optional[List[float]],
         nexus_kb_keywords: Optional[set] = None,
+        bm25_rank_map: Optional[Dict[str, int]] = None,
     ) -> List[Dict[str, Any]]:
-        """Compute hybrid score = vector_score + lexical_boost + nexus_boost."""
+        """Compute hybrid score using RRF fusion + lexical + nexus boosts.
+
+        Wave 2 RRF approach:
+          1. BM25 rank is taken from bm25_rank_map (preserved from Phase 1)
+          2. Vector scores are computed; candidates sorted to get vector rank
+          3. RRF = 1/(k + bm25_rank) + 1/(k + vector_rank)
+          4. Lexical + nexus boosts applied as additive tiebreakers
+
+        When no embedding is available, BM25-only RRF is used (vector_rank
+        defaults to position in input list, which is arbitrary but consistent).
+        """
         from openspace.cloud.embedding import cosine_similarity
 
-        scored = []
-        for c in candidates:
+        bm25_rank_map = bm25_rank_map or {}
+
+        # Step 1: Compute vector scores for all candidates
+        vector_scores: list[tuple[int, float]] = []  # (original_index, score)
+        raw_entries: list[Dict[str, Any]] = []
+
+        for idx, c in enumerate(candidates):
             name = c.get("name", "")
             slug = c.get("skill_id", name).split("__")[0].replace(":", "-")
 
-            # Vector score
             vector_score = 0.0
             if query_embedding:
                 skill_emb = c.get("_embedding")
                 if skill_emb and isinstance(skill_emb, list):
                     vector_score = cosine_similarity(query_embedding, skill_emb)
 
-            # Lexical boost
             lexical = _lexical_boost(query_tokens, name, slug)
 
-            # Nexus-kb cross-validation boost
             nexus_boost = 0.0
             if nexus_kb_keywords:
                 name_tokens = _tokenize(name)
                 desc_tokens = _tokenize(c.get("description", ""))
                 candidate_tokens = set(name_tokens + desc_tokens)
-                overlap = candidate_tokens & nexus_kb_keywords
-                if overlap:
+                if candidate_tokens & nexus_kb_keywords:
                     nexus_boost = _NEXUS_KB_CROSS_VALIDATION_BOOST
 
-            final_score = vector_score + lexical + nexus_boost
+            vector_scores.append((idx, vector_score))
+            raw_entries.append({
+                "_c": c,
+                "_idx": idx,
+                "_name": name,
+                "_slug": slug,
+                "_vector_score": vector_score,
+                "_lexical": lexical,
+                "_nexus_boost": nexus_boost,
+            })
+
+        # Step 2: Derive vector rank (highest vector_score = rank 0)
+        sorted_by_vector = sorted(vector_scores, key=lambda x: -x[1])
+        vector_rank_map: Dict[int, int] = {
+            orig_idx: rank for rank, (orig_idx, _) in enumerate(sorted_by_vector)
+        }
+
+        # Step 3: RRF fusion + lexical/nexus boosts
+        scored = []
+        for e in raw_entries:
+            c = e["_c"]
+            skill_id = c.get("skill_id", "")
+            orig_idx = e["_idx"]
+
+            bm25_rank = bm25_rank_map.get(skill_id, orig_idx)
+            vector_rank = vector_rank_map.get(orig_idx, orig_idx)
+
+            rrf = 1.0 / (_RRF_K + bm25_rank) + 1.0 / (_RRF_K + vector_rank)
+            final_score = rrf + e["_lexical"] + e["_nexus_boost"]
 
             entry: Dict[str, Any] = {
-                "skill_id": c.get("skill_id", ""),
-                "name": name,
+                "skill_id": skill_id,
+                "name": e["_name"],
                 "description": c.get("description", ""),
                 "source": c.get("source", ""),
-                "score": round(final_score, 4),
+                "score": round(final_score, 6),
             }
-            if vector_score > 0:
-                entry["vector_score"] = round(vector_score, 4)
-            if nexus_boost > 0:
+            if e["_vector_score"] > 0:
+                entry["vector_score"] = round(e["_vector_score"], 4)
+            if e["_nexus_boost"] > 0:
                 entry["nexus_kb_validated"] = True
-            # Include optional fields
             for key in ("path", "visibility", "created_by", "origin", "tags", "quality", "safety_flags"):
                 if c.get(key):
                     entry[key] = c[key]
@@ -280,6 +404,9 @@ def build_local_candidates(
             "is_local": True,
             "safety_flags": flags if flags else None,
             "_embedding_text": embedding_text,
+            # Wave 2: expose body separately so BM25 can index SKILL.md content
+            # without double-counting name/description tokens.
+            "_body": readme_body,
         })
 
     # Enrich with quality data
