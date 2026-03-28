@@ -220,8 +220,10 @@ class SkillEvolver:
 
         # W6 Step 13: counter for periodic bandit decay (every 100 analyses).
         self._analysis_count: int = 0
-        # W8: flag to seed _analysis_count from persisted DB on first process_analysis call.
+        # W8: flag + lock to seed _analysis_count from persisted DB on first call.
+        # Lock prevents two concurrent first calls from both seeding (race condition).
         self._analysis_count_initialized: bool = False
+        self._analysis_count_init_lock: asyncio.Lock = asyncio.Lock()
 
     def set_available_tools(self, tools: List["BaseTool"]) -> None:
         """Update the tools available for evolution agent loops."""
@@ -306,10 +308,16 @@ class SkillEvolver:
 
         # W8: Seed _analysis_count from persistent store on first call so the
         # decay trigger survives process restarts (counts carry over correctly).
+        # Lock prevents concurrent first calls from both seeding the same value.
+        # Subtract 1: analyze_execution() persists the current analysis *before*
+        # calling process_analysis(), so COUNT(*) already includes it — decrement
+        # avoids double-counting and keeps decay firing at the correct multiples.
         if not self._analysis_count_initialized:
-            persisted = await asyncio.to_thread(self._store.get_analysis_count)
-            self._analysis_count = persisted
-            self._analysis_count_initialized = True
+            async with self._analysis_count_init_lock:
+                if not self._analysis_count_initialized:  # double-checked locking
+                    persisted = await asyncio.to_thread(self._store.get_analysis_count)
+                    self._analysis_count = max(0, persisted - 1)
+                    self._analysis_count_initialized = True
 
         # W6 Step 13: Periodic bandit decay — prevents exploration collapse.
         # Shrinks Beta posteriors toward Beta(1,1) every 100 analyses.

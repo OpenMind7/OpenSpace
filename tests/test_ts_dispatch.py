@@ -246,6 +246,7 @@ class TestBanditUpdateIntegration:
         store = MagicMock()
         store.update_bandit = AsyncMock()
         store.add_failure_lesson = AsyncMock()
+        store.get_analysis_count = MagicMock(return_value=0)
         return store
 
     @pytest.fixture

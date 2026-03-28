@@ -207,3 +207,81 @@ class TestToolLayerDispatchEvent:
         )
         result = await tl._select_and_inject_skills("do stuff", task_id="task-err")
         assert result is True  # non-fatal — method returns True despite store error
+
+
+class TestBanditSnapshotTruncationViaToolLayer:
+    """Verify that tool_layer's _select_and_inject_skills truncates bandit_snapshot
+    to only the *final dispatched* skill IDs, not the full bandit_stats pool.
+
+    This exercises the production filtering path at tool_layer.py:761-767.
+    A regression that passes bandit_stats unfiltered would fail this test.
+    """
+
+    def _make_tool_layer_with_truncation(self):
+        """4-skill bandit pool, ts_blend_reorder returns only 2 — snapshot must have 2."""
+        from openspace.skill_engine.types import SkillBanditStats
+        from openspace.tool_layer import OpenSpace
+
+        tl = object.__new__(OpenSpace)
+        tl._initialized = True
+        tl._running = False
+
+        # Pool of 4 mock skills
+        def make_skill(sid):
+            s = MagicMock()
+            s.skill_id = sid
+            s.content = f"content-{sid}"
+            return s
+
+        pool = [make_skill(f"sk-{c}") for c in ("a", "b", "c", "d")]
+        final_two = pool[1:3]  # sk-b, sk-c are the final dispatched set
+
+        registry = MagicMock()
+        registry.select_skills_with_llm = AsyncMock(
+            return_value=(pool, {"method": "ts", "task": "go", "selected": [s.skill_id for s in pool]})
+        )
+        registry.list_skills = MagicMock(return_value=pool)
+        # ts_blend_reorder truncates pool → final_two
+        registry.ts_blend_reorder = MagicMock(return_value=final_two)
+        registry.build_context_injection = MagicMock(return_value="ctx")
+
+        # bandit_stats covers ALL 4 pool skills
+        bandit_stats = {
+            f"sk-{c}": SkillBanditStats(skill_id=f"sk-{c}", alpha=2.0, beta=2.0)
+            for c in ("a", "b", "c", "d")
+        }
+
+        store = MagicMock()
+        store.get_summary = MagicMock(return_value=[])
+        store.get_bandit_stats = MagicMock(return_value=bandit_stats)
+        store.record_dispatch_event = AsyncMock()
+        tl._skill_store = store
+        tl._skill_registry = registry
+        tl._grounding_agent = MagicMock()
+        tl._grounding_config = MagicMock()
+        tl._grounding_config.skills.max_select = 2
+        tl._recording_manager = None
+        tl.config = MagicMock()
+        tl.config.skill_registry_model = None
+        tl.config.tool_retrieval_model = None
+        tl.config.llm_model = "test-model"
+        tl._llm_client = MagicMock()
+        tl._llm_client.model = "test-model"
+        tl._get_skill_selection_llm = MagicMock(return_value=None)
+        return tl
+
+    @pytest.mark.asyncio
+    async def test_snapshot_truncated_to_final_dispatched_skills(self):
+        tl = self._make_tool_layer_with_truncation()
+        await tl._select_and_inject_skills("go", task_id="trunc-via-tl")
+
+        tl._skill_store.record_dispatch_event.assert_called_once()
+        _, kwargs = tl._skill_store.record_dispatch_event.call_args
+        snapshot = kwargs.get("bandit_snapshot") or {}
+
+        assert set(snapshot.keys()) == {"sk-b", "sk-c"}, (
+            f"Expected snapshot keys {{sk-b, sk-c}}, got {set(snapshot.keys())}"
+        )
+        # Pool skills that were NOT dispatched must NOT appear in snapshot
+        assert "sk-a" not in snapshot
+        assert "sk-d" not in snapshot

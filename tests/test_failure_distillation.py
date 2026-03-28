@@ -48,6 +48,7 @@ def make_evolver(store=None) -> SkillEvolver:
         store = MagicMock()
         store.add_failure_lesson = AsyncMock()
         store.get_recent_failure_lessons = MagicMock(return_value=[])
+        store.get_analysis_count = MagicMock(return_value=0)
     registry = MagicMock()
     llm_client = AsyncMock()
     llm_client.model = "test-model"

@@ -354,7 +354,7 @@ class SkillStore:
                 )
             except Exception as e:
                 if "duplicate column" not in str(e).lower():
-                    logger.warning("bandit_snapshot migration failed: %s", e)
+                    raise RuntimeError(f"bandit_snapshot migration failed: {e}") from e
             self._conn.commit()
 
     # Lifecycle
