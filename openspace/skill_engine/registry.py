@@ -110,12 +110,17 @@ class SkillRegistry:
     All internal maps are keyed by ``skill_id``, not ``name``.
     """
 
-    def __init__(self, skill_dirs: Optional[List[Path]] = None) -> None:
+    def __init__(
+        self,
+        skill_dirs: Optional[List[Path]] = None,
+        skill_cfg: "Optional[Any]" = None,
+    ) -> None:
         self._skill_dirs: List[Path] = skill_dirs or []
         self._skills: Dict[str, SkillMeta] = {}     # skill_id -> SkillMeta
         self._content_cache: Dict[str, str] = {}     # skill_id -> raw SKILL.md content
         self._discovered = False
         self._ranker: Optional[SkillRanker] = None   # lazy-init on first use
+        self._skill_cfg = skill_cfg  # Optional[SkillConfig] — for ranker config
 
     def discover(self) -> List[SkillMeta]:
         """Scan all skill_dirs and populate the registry.
@@ -334,7 +339,13 @@ class SkillRegistry:
     def ranker(self) -> SkillRanker:
         """Lazy-initialised :class:`SkillRanker` for hybrid pre-filtering."""
         if self._ranker is None:
-            self._ranker = SkillRanker()
+            kwargs: Dict[str, Any] = {}
+            cfg = self._skill_cfg
+            if cfg is not None:
+                kwargs["enable_cross_encoder"] = cfg.enable_cross_encoder
+                kwargs["cross_encoder_model"] = cfg.cross_encoder_model
+                kwargs["cross_encoder_top_k"] = cfg.cross_encoder_top_k
+            self._ranker = SkillRanker(**kwargs)
         return self._ranker
 
     async def select_skills_with_llm(

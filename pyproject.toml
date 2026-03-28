@@ -57,8 +57,12 @@ dev = [
     "mypy>=1.0.0",
 ]
 
+rerank = [
+    "sentence-transformers>=3.0.0",
+]
+
 all = [
-    "openspace[macos,linux,windows,dev]",
+    "openspace[macos,linux,windows,dev,rerank]",
 ]
 
 [project.urls]

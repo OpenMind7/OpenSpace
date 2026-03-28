@@ -221,6 +221,22 @@ class SkillConfig(BaseModel):
         2, ge=1, le=20,
         description="Maximum number of skills to inject per task"
     )
+    enable_cross_encoder: bool = Field(
+        False,
+        description=(
+            "Enable cross-encoder reranking as Stage 3 after BM25+embedding. "
+            "Requires sentence-transformers. Adds ~5-50ms/call on CPU. "
+            "Most effective when local skill count exceeds 50."
+        ),
+    )
+    cross_encoder_model: str = Field(
+        "cross-encoder/ms-marco-MiniLM-L-6-v2",
+        description="HuggingFace cross-encoder model name for Stage 3 reranking.",
+    )
+    cross_encoder_top_k: int = Field(
+        5, ge=1, le=20,
+        description="Number of candidates to return after cross-encoder reranking.",
+    )
 
 
 class GroundingConfig(BaseModel):

@@ -80,10 +80,20 @@ class SkillRanker:
         *,
         cache_dir: Optional[Path] = None,
         enable_cache: bool = True,
+        enable_cross_encoder: bool = False,
+        cross_encoder_model: str = "cross-encoder/ms-marco-MiniLM-L-6-v2",
+        cross_encoder_top_k: int = 5,
     ) -> None:
         # Embedding cache: skill_id → List[float]
         self._embedding_cache: Dict[str, List[float]] = {}
         self._enable_cache = enable_cache
+        # Cross-encoder (Stage 3) — lazy-loaded
+        self._enable_cross_encoder = enable_cross_encoder
+        self._cross_encoder_model_name = cross_encoder_model
+        self._cross_encoder_top_k = cross_encoder_top_k
+        self._cross_encoder: Any = None  # loaded on first use
+        # Rerank cache: sha256[:16] → ordered List[skill_id]
+        self._rerank_cache: Dict[str, List[str]] = {}
 
         if cache_dir is None:
             try:
@@ -117,16 +127,83 @@ class SkillRanker:
         if not bm25_top:
             # BM25 found nothing — try embedding on all candidates
             emb_results = self._embedding_rank(query, candidates, top_k)
-            return emb_results if emb_results else candidates[:top_k]
+            stage2 = emb_results if emb_results else candidates[:top_k]
+            return self.rerank(query, stage2) if self._enable_cross_encoder else stage2
 
         # Stage 2: Embedding re-rank on BM25 candidates
         emb_results = self._embedding_rank(query, bm25_top, top_k)
         if emb_results:
-            return emb_results
+            return self.rerank(query, emb_results) if self._enable_cross_encoder else emb_results
 
         # Embedding unavailable — return BM25 results
         logger.debug("Embedding unavailable, using BM25-only results")
-        return bm25_top[:top_k]
+        stage2 = bm25_top[:top_k]
+        return self.rerank(query, stage2) if self._enable_cross_encoder else stage2
+
+    def rerank(
+        self,
+        query: str,
+        candidates: List[SkillCandidate],
+        top_k: Optional[int] = None,
+    ) -> List[SkillCandidate]:
+        """Stage 3: Cross-encoder reranking over Stage 2 candidates.
+
+        Scores each (query, skill_text) pair using a cross-encoder model.
+        Results are cached by (query × candidate_set) hash.
+
+        Falls back to returning candidates[:top_k] if the model is unavailable.
+        """
+        if not candidates or not self._enable_cross_encoder:
+            return candidates
+        k = top_k if top_k is not None else self._cross_encoder_top_k
+
+        import hashlib
+        cache_key = hashlib.sha256(
+            f"{query}|{','.join(sorted(c.skill_id for c in candidates))}".encode()
+        ).hexdigest()[:16]
+        if cache_key in self._rerank_cache:
+            ordered_ids = self._rerank_cache[cache_key]
+            id_to_c = {c.skill_id: c for c in candidates}
+            result = [id_to_c[sid] for sid in ordered_ids if sid in id_to_c]
+            return result[:k]
+
+        ce = self._get_cross_encoder()
+        if ce is None:
+            return candidates[:k]
+
+        pairs = [
+            (query, f"{c.name}: {c.description}\n{c.body[:500]}")
+            for c in candidates
+        ]
+        try:
+            scores = ce.predict(pairs)
+        except Exception as exc:
+            logger.warning("Cross-encoder prediction failed: %s", exc)
+            return candidates[:k]
+
+        ranked = sorted(zip(candidates, scores), key=lambda x: x[1], reverse=True)
+        result = [c for c, _ in ranked]
+        self._rerank_cache[cache_key] = [c.skill_id for c in result]
+        return result[:k]
+
+    def _get_cross_encoder(self) -> Any:
+        """Lazy-load the cross-encoder model. Returns None if unavailable."""
+        if self._cross_encoder is not None:
+            return self._cross_encoder
+        try:
+            from sentence_transformers import CrossEncoder  # type: ignore
+            self._cross_encoder = CrossEncoder(self._cross_encoder_model_name)
+            logger.info("Cross-encoder loaded: %s", self._cross_encoder_model_name)
+        except ImportError:
+            logger.warning(
+                "sentence-transformers not installed; cross-encoder disabled. "
+                "Install with: pip install sentence-transformers"
+            )
+            self._enable_cross_encoder = False
+        except Exception as exc:
+            logger.warning("Failed to load cross-encoder model: %s", exc)
+            self._enable_cross_encoder = False
+        return self._cross_encoder
 
     def bm25_only(
         self,

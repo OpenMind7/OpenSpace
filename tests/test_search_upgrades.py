@@ -427,3 +427,193 @@ class TestSearchPipelineIntegration:
         result_keys = {(r["source"], r["skill_id"]) for r in results}
         assert ("local", "s__abc") in result_keys
         assert ("cloud", "s__abc") in result_keys
+
+
+# ---------------------------------------------------------------------------
+# Cross-encoder reranking (Wave 5 Priority 1)
+# ---------------------------------------------------------------------------
+
+def _make_sc(skill_id: str, name: str = "", description: str = "", body: str = ""):
+    from openspace.skill_engine.skill_ranker import SkillCandidate
+    return SkillCandidate(
+        skill_id=skill_id,
+        name=name or skill_id,
+        description=description or f"Description for {skill_id}",
+        body=body,
+    )
+
+
+class TestCrossEncoderDisabledByDefault:
+    """Cross-encoder must be opt-in (disabled by default)."""
+
+    def test_skill_config_default_disabled(self):
+        from openspace.config.grounding import SkillConfig
+        cfg = SkillConfig()
+        assert cfg.enable_cross_encoder is False
+
+    def test_skill_ranker_default_disabled(self):
+        from openspace.skill_engine.skill_ranker import SkillRanker
+        r = SkillRanker()
+        assert r._enable_cross_encoder is False
+
+    def test_rerank_passthrough_when_disabled(self):
+        """rerank() returns input unchanged when cross-encoder disabled."""
+        from openspace.skill_engine.skill_ranker import SkillRanker
+        r = SkillRanker(enable_cross_encoder=False)
+        candidates = [_make_sc("a"), _make_sc("b"), _make_sc("c")]
+        result = r.rerank("some query", candidates)
+        # All candidates returned when disabled (no slicing by cross_encoder_top_k)
+        assert result == candidates
+
+    def test_hybrid_rank_no_cross_encoder_called(self):
+        """hybrid_rank must NOT call rerank when cross_encoder is disabled."""
+        from openspace.skill_engine.skill_ranker import SkillRanker
+        r = SkillRanker(enable_cross_encoder=False)
+        candidates = [_make_sc(f"s{i}") for i in range(5)]
+
+        called = []
+        original_rerank = r.rerank
+        def spy_rerank(*args, **kwargs):
+            called.append(True)
+            return original_rerank(*args, **kwargs)
+
+        r.rerank = spy_rerank
+        r.hybrid_rank("test query", candidates, top_k=3)
+        assert not called, "rerank must not be called when cross_encoder disabled"
+
+
+class TestCrossEncoderRerank:
+    """Cross-encoder reranking logic with mocked model."""
+
+    def _ranker_with_mock_ce(self, mock_scores: List[float]):
+        """Build a SkillRanker with cross-encoder enabled and a mocked predict()."""
+        from openspace.skill_engine.skill_ranker import SkillRanker
+        r = SkillRanker(enable_cross_encoder=True, cross_encoder_top_k=3)
+        mock_ce = MagicMock()
+        mock_ce.predict.return_value = mock_scores
+        r._cross_encoder = mock_ce  # inject mock, skip lazy load
+        return r, mock_ce
+
+    def test_rerank_orders_by_score_descending(self):
+        r, mock_ce = self._ranker_with_mock_ce([0.1, 0.9, 0.5])
+        candidates = [_make_sc("low"), _make_sc("high"), _make_sc("mid")]
+        result = r.rerank("query", candidates, top_k=3)
+        assert [c.skill_id for c in result] == ["high", "mid", "low"]
+
+    def test_rerank_respects_top_k(self):
+        r, _ = self._ranker_with_mock_ce([0.9, 0.8, 0.7, 0.6, 0.5])
+        candidates = [_make_sc(f"s{i}") for i in range(5)]
+        result = r.rerank("query", candidates, top_k=2)
+        assert len(result) == 2
+
+    def test_rerank_uses_default_top_k(self):
+        from openspace.skill_engine.skill_ranker import SkillRanker
+        r = SkillRanker(enable_cross_encoder=True, cross_encoder_top_k=2)
+        mock_ce = MagicMock()
+        mock_ce.predict.return_value = [0.9, 0.8, 0.7, 0.6]
+        r._cross_encoder = mock_ce
+        candidates = [_make_sc(f"s{i}") for i in range(4)]
+        result = r.rerank("query", candidates)
+        assert len(result) == 2
+
+    def test_rerank_returns_empty_for_empty_candidates(self):
+        r, _ = self._ranker_with_mock_ce([])
+        result = r.rerank("query", [])
+        assert result == []
+
+    def test_rerank_cache_hit_skips_predict(self):
+        """Second identical call must use cache — predict NOT called again."""
+        r, mock_ce = self._ranker_with_mock_ce([0.9, 0.5, 0.1])
+        candidates = [_make_sc("a"), _make_sc("b"), _make_sc("c")]
+        r.rerank("query", candidates, top_k=3)
+        r.rerank("query", candidates, top_k=3)
+        assert mock_ce.predict.call_count == 1, "predict must be called only once (cache hit)"
+
+    def test_rerank_cache_miss_different_query(self):
+        """Different query → cache miss → predict called again."""
+        r, mock_ce = self._ranker_with_mock_ce([0.9, 0.5, 0.1])
+        mock_ce.predict.return_value = [0.9, 0.5, 0.1]
+        candidates = [_make_sc("a"), _make_sc("b"), _make_sc("c")]
+        r.rerank("query one", candidates)
+        r.rerank("query two", candidates)
+        assert mock_ce.predict.call_count == 2
+
+    def test_rerank_predict_failure_returns_candidates_truncated(self):
+        """If predict() raises, return candidates[:top_k] gracefully."""
+        from openspace.skill_engine.skill_ranker import SkillRanker
+        r = SkillRanker(enable_cross_encoder=True, cross_encoder_top_k=2)
+        mock_ce = MagicMock()
+        mock_ce.predict.side_effect = RuntimeError("model error")
+        r._cross_encoder = mock_ce
+        candidates = [_make_sc(f"s{i}") for i in range(4)]
+        result = r.rerank("query", candidates, top_k=2)
+        assert len(result) == 2
+        assert result[0].skill_id == "s0"  # original order preserved
+
+    def test_hybrid_rank_calls_rerank_when_enabled(self):
+        """hybrid_rank calls rerank() as Stage 3 when cross_encoder enabled."""
+        from openspace.skill_engine.skill_ranker import SkillRanker
+        r = SkillRanker(enable_cross_encoder=True, cross_encoder_top_k=3)
+        mock_ce = MagicMock()
+        mock_ce.predict.return_value = [float(i) for i in range(10)]
+        r._cross_encoder = mock_ce
+
+        candidates = [_make_sc(f"s{i}") for i in range(5)]
+        # Patch embedding to return empty (BM25-only path) so pipeline runs
+        with patch.object(r, "_embedding_rank", return_value=[]):
+            r.hybrid_rank("test query", candidates, top_k=3)
+
+        assert mock_ce.predict.called, "cross-encoder predict must be called in hybrid_rank"
+
+
+class TestCrossEncoderMissingDependency:
+    """_get_cross_encoder gracefully disables when sentence-transformers absent."""
+
+    def test_import_error_disables_cross_encoder(self):
+        from openspace.skill_engine.skill_ranker import SkillRanker
+        r = SkillRanker(enable_cross_encoder=True)
+
+        import builtins
+        real_import = builtins.__import__
+
+        def mock_import(name, *args, **kwargs):
+            if name == "sentence_transformers":
+                raise ImportError("mocked missing")
+            return real_import(name, *args, **kwargs)
+
+        with patch("builtins.__import__", side_effect=mock_import):
+            ce = r._get_cross_encoder()
+
+        assert ce is None
+        assert r._enable_cross_encoder is False
+
+    def test_rerank_passthrough_after_import_failure(self):
+        """After failed load, rerank() returns candidates unchanged."""
+        from openspace.skill_engine.skill_ranker import SkillRanker
+        r = SkillRanker(enable_cross_encoder=True)
+        # Simulate load failure
+        r._enable_cross_encoder = False
+        candidates = [_make_sc("a"), _make_sc("b")]
+        result = r.rerank("query", candidates)
+        assert result == candidates
+
+
+class TestSkillRegistryCrossEncoderConfig:
+    """SkillRegistry.ranker picks up cross-encoder settings from SkillConfig."""
+
+    def test_ranker_gets_enable_cross_encoder_from_config(self):
+        from openspace.skill_engine.registry import SkillRegistry
+        from openspace.config.grounding import SkillConfig
+        cfg = SkillConfig(enable_cross_encoder=True, cross_encoder_top_k=7)
+        reg = SkillRegistry(skill_cfg=cfg)
+        ranker = reg.ranker
+        assert ranker._enable_cross_encoder is True
+        assert ranker._cross_encoder_top_k == 7
+
+    def test_ranker_defaults_when_no_config(self):
+        from openspace.skill_engine.registry import SkillRegistry
+        from openspace.skill_engine.skill_ranker import SkillRanker
+        reg = SkillRegistry()
+        ranker = reg.ranker
+        assert isinstance(ranker, SkillRanker)
+        assert ranker._enable_cross_encoder is False

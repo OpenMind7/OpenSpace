@@ -642,7 +642,7 @@ class OpenSpace:
             logger.debug("No skill directories found, skills disabled")
             return None
 
-        registry = SkillRegistry(skill_dirs=skill_paths)
+        registry = SkillRegistry(skill_dirs=skill_paths, skill_cfg=skill_cfg)
         registry.discover()
         return registry
 
