@@ -711,7 +711,9 @@ class OpenSpace:
                 bandit_stats = self._skill_store.get_bandit_stats(
                     [s.skill_id for s in selected]
                 )
-                selected = self._skill_registry.ts_blend_reorder(selected, bandit_stats)
+                selected = self._skill_registry.ts_blend_reorder(
+                    selected, bandit_stats, skill_quality=skill_quality
+                )
             except Exception as _ts_exc:
                 logger.debug("TS blend failed — using hybrid order: %s", _ts_exc)
 

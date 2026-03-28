@@ -393,7 +393,9 @@ class SkillRegistry:
         if not available:
             return [], None
 
-        # Quality-based filtering: remove skills that consistently fail
+        # Quality-based filtering: only hard-exclude severely broken skills.
+        # Thresholds are intentionally high so TS can explore weak-history
+        # skills — soft quality penalty is applied later in ts_blend_reorder.
         filtered_out: List[str] = []
         if skill_quality:
             kept: List[SkillMeta] = []
@@ -404,19 +406,19 @@ class SkillRegistry:
                     applied = q.get("total_applied", 0)
                     completions = q.get("total_completions", 0)
                     fallbacks = q.get("total_fallbacks", 0)
-                    # Filter 1: selected multiple times but never completed
-                    if selections >= 2 and completions == 0:
+                    # Filter 1: many selections but zero completions (clearly broken)
+                    if selections >= 5 and completions == 0:
                         filtered_out.append(s.skill_id)
                         continue
-                    # Filter 2: high fallback rate when applied
-                    if applied >= 2 and fallbacks / applied > 0.5:
+                    # Filter 2: very high fallback rate over substantial runs
+                    if applied >= 5 and fallbacks / applied > 0.75:
                         filtered_out.append(s.skill_id)
                         continue
                 kept.append(s)
             if filtered_out:
                 logger.info(
                     f"Skill quality filter: removed {len(filtered_out)} "
-                    f"high-fallback skill(s): {filtered_out}"
+                    f"severely broken skill(s): {filtered_out}"
                 )
             available = kept
 
@@ -596,12 +598,16 @@ class SkillRegistry:
         bandit_stats: Dict[str, "SkillBanditStats"],
         *,
         ts_weight: float = 0.25,
+        skill_quality: Optional[Dict[str, Dict[str, Any]]] = None,
     ) -> List[SkillMeta]:
         """Reorder *candidates* by blending Thompson Sampling with hybrid rank.
 
         Hybrid position score: linear decay from rank (1st → 1.0, last → 0.0).
         TS score: Beta(alpha, beta) sample — exploration/exploitation draw.
-        Final = (1 - ts_weight) * hybrid_score + ts_weight * ts_sample
+        Quality penalty: multiplied into hybrid_score for weak-history skills
+        so TS exploration can still override via sampling.
+
+        Final = (1 - ts_weight) * hybrid_score * quality_penalty + ts_weight * ts_sample
 
         ts_weight=0.25 keeps the hybrid signal dominant (0.75 weight) while
         allowing bandit exploration to influence ordering.  Falls back to
@@ -614,9 +620,25 @@ class SkillRegistry:
         blended: List[tuple] = []
         for rank, skill in enumerate(candidates):
             hybrid_score = 1.0 - rank / n
+
+            # Soft quality penalty: dampen hybrid score for weak-history skills.
+            # TS sample is unaffected so exploration can still promote them.
+            quality_penalty = 1.0
+            if skill_quality:
+                q = skill_quality.get(skill.skill_id)
+                if q:
+                    sel = q.get("total_selections", 0)
+                    app = q.get("total_applied", 0)
+                    comp = q.get("total_completions", 0)
+                    fb = q.get("total_fallbacks", 0)
+                    if sel >= 3 and comp == 0:
+                        quality_penalty = 0.5
+                    elif app >= 2 and fb > 0 and fb / app > 0.5:
+                        quality_penalty = 0.5
+
             stats = bandit_stats.get(skill.skill_id)
             ts_score = stats.sample() if stats else 0.5  # neutral default if missing
-            score = (1.0 - ts_weight) * hybrid_score + ts_weight * ts_score
+            score = (1.0 - ts_weight) * hybrid_score * quality_penalty + ts_weight * ts_score
             blended.append((score, skill))
 
         blended.sort(key=lambda x: x[0], reverse=True)
