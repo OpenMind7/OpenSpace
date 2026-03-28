@@ -29,7 +29,13 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, TYPE_CHECKING
 
 from openspace.utils.logging import Logger
-from .skill_utils import parse_frontmatter, strip_frontmatter, check_skill_safety, is_skill_safe
+from .skill_utils import (
+    parse_frontmatter,
+    strip_frontmatter,
+    check_skill_safety,
+    check_skill_directory_safety,
+    is_skill_safe,
+)
 from .skill_ranker import SkillRanker, SkillCandidate, PREFILTER_THRESHOLD
 
 if TYPE_CHECKING:
@@ -151,8 +157,9 @@ class SkillRegistry:
                 try:
                     content = skill_file.read_text(encoding="utf-8")
 
-                    # Safety check on skill content
-                    safety_flags = check_skill_safety(content)
+                    # Safety check: scan every file in the skill directory (not just SKILL.md).
+                    # Malicious helper files (.py, .sh, etc.) must also be rejected.
+                    safety_flags = check_skill_directory_safety(entry)
                     if not is_skill_safe(safety_flags):
                         logger.warning(
                             f"BLOCKED skill {entry.name}: "
@@ -271,8 +278,8 @@ class SkillRegistry:
                 try:
                     content = skill_file.read_text(encoding="utf-8")
 
-                    # Safety check (same as discover())
-                    safety_flags = check_skill_safety(content)
+                    # Safety check: scan full skill directory (same as discover()).
+                    safety_flags = check_skill_directory_safety(entry)
                     if not is_skill_safe(safety_flags):
                         logger.warning(
                             f"BLOCKED external skill {entry.name}: "
@@ -316,8 +323,8 @@ class SkillRegistry:
         try:
             content = skill_file.read_text(encoding="utf-8")
 
-            # Safety check (same as discover())
-            safety_flags = check_skill_safety(content)
+            # Safety check: scan full skill directory (same as discover()).
+            safety_flags = check_skill_directory_safety(skill_dir)
             if not is_skill_safe(safety_flags):
                 logger.warning(
                     f"BLOCKED skill {skill_dir.name}: "

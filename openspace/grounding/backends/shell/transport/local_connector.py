@@ -11,6 +11,7 @@ work without any changes.
 import asyncio
 import os
 import platform
+import signal
 import tempfile
 import uuid
 from typing import Any, Optional, Dict
@@ -188,6 +189,7 @@ class LocalShellConnector(BaseConnector[Any]):
 
         cwd = working_dir or os.getcwd()
 
+        proc: asyncio.subprocess.Process | None = None
         try:
             proc = await asyncio.create_subprocess_exec(
                 *cmd,
@@ -195,6 +197,7 @@ class LocalShellConnector(BaseConnector[Any]):
                 stderr=asyncio.subprocess.PIPE,
                 cwd=cwd,
                 env=exec_env,
+                start_new_session=True,  # own process group — enables clean kill on timeout
             )
             stdout_b, stderr_b = await asyncio.wait_for(
                 proc.communicate(), timeout=timeout
@@ -211,6 +214,15 @@ class LocalShellConnector(BaseConnector[Any]):
                 "returncode": returncode,
             }
         except asyncio.TimeoutError:
+            if proc is not None:
+                try:
+                    os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+                except (ProcessLookupError, OSError):
+                    pass  # process already exited before we could kill it
+                try:
+                    await proc.wait()
+                except Exception:
+                    pass
             return {
                 "status": "error",
                 "output": f"Execution timed out after {timeout} seconds",
@@ -242,19 +254,21 @@ class LocalShellConnector(BaseConnector[Any]):
 
         cwd = working_dir or os.getcwd()
 
+        proc_shell: asyncio.subprocess.Process | None = None
         try:
-            proc = await asyncio.create_subprocess_shell(
+            proc_shell = await asyncio.create_subprocess_shell(
                 shell_cmd,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.STDOUT,
                 cwd=cwd,
                 env=exec_env,
+                start_new_session=True,  # own process group — enables clean kill on timeout
             )
             stdout_b, _ = await asyncio.wait_for(
-                proc.communicate(), timeout=timeout
+                proc_shell.communicate(), timeout=timeout
             )
             stdout = stdout_b.decode("utf-8", errors="replace") if stdout_b else ""
-            returncode = proc.returncode or 0
+            returncode = proc_shell.returncode or 0
 
             return {
                 "status": "success" if returncode == 0 else "error",
@@ -264,6 +278,15 @@ class LocalShellConnector(BaseConnector[Any]):
                 "returncode": returncode,
             }
         except asyncio.TimeoutError:
+            if proc_shell is not None:
+                try:
+                    os.killpg(os.getpgid(proc_shell.pid), signal.SIGKILL)
+                except (ProcessLookupError, OSError):
+                    pass  # process already exited before we could kill it
+                try:
+                    await proc_shell.wait()
+                except Exception:
+                    pass
             return {
                 "status": "error",
                 "output": f"Script execution timed out after {timeout} seconds",

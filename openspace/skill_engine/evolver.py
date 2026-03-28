@@ -55,6 +55,7 @@ from .skill_utils import (
     truncate as _truncate,
     validate_skill_dir as _validate_skill_dir,
     check_skill_safety as _check_skill_safety,
+    check_skill_directory_safety as _check_skill_directory_safety,
     is_skill_safe as _is_skill_safe,
     parse_capabilities as _parse_capabilities,
     check_capability_violations as _check_capability_violations,
@@ -1533,9 +1534,9 @@ Respond with JSON only:
                 # Validate the result
                 validation_error = _validate_skill_dir(skill_dir)
                 if validation_error is None:
-                    # Post-evolution safety re-scan: reject unsafe evolved content
-                    skill_content = (skill_dir / SKILL_FILENAME).read_text(encoding="utf-8")
-                    safety_flags = _check_skill_safety(skill_content)
+                    # Post-evolution safety re-scan: scan full skill directory,
+                    # not just SKILL.md — evolved helpers must also pass.
+                    safety_flags = _check_skill_directory_safety(skill_dir)
                     if not _is_skill_safe(safety_flags):
                         blocking = [f for f in safety_flags if f.startswith("blocked.")]
                         logger.error(

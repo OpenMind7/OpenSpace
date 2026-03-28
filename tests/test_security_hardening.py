@@ -129,14 +129,22 @@ class TestSafetyRules:
 
     # --- _BLOCKING_FLAGS count ---
 
-    def test_three_blocking_flags_defined(self):
-        """Ensures Wave 1 raised blocking flag count from 1 to 3."""
+    def test_blocking_flags_defined(self):
+        """All required blocking flag names must be present in _BLOCKING_FLAGS.
+
+        W1 added 3 flags.  W10 added 2 more for fail-closed directory scanning.
+        """
         from openspace.skill_engine.skill_utils import _BLOCKING_FLAGS
-        assert "blocked.malware" in _BLOCKING_FLAGS
-        assert "blocked.shell_injection" in _BLOCKING_FLAGS
-        assert "blocked.credential_exfil" in _BLOCKING_FLAGS
-        assert len(_BLOCKING_FLAGS) == 3, \
-            f"Expected 3 blocking flags, got {len(_BLOCKING_FLAGS)}: {_BLOCKING_FLAGS}"
+        required = {
+            "blocked.malware",
+            "blocked.shell_injection",
+            "blocked.credential_exfil",
+            "blocked.unreadable_file",        # W10: fail-closed for unreadable helpers
+            "blocked.unreadable_directory",   # W10: fail-closed for unreadable skill dirs
+        }
+        assert required <= _BLOCKING_FLAGS, (
+            f"Missing blocking flags: {required - _BLOCKING_FLAGS}"
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -433,3 +441,109 @@ class TestToolFiltering:
 
     def test_empty_tool_list_passes(self):
         assert self._apply_filter([]) == []
+
+
+# ---------------------------------------------------------------------------
+# W10 — Process group kill on timeout (local_connector.py)
+# ---------------------------------------------------------------------------
+
+class TestSubprocessGroupKill:
+    """Verify that LocalShellConnector kills the process group on timeout.
+
+    We use a short-lived sleep command and a fabricated TimeoutError so the
+    test runs fast without relying on real wall-clock delays.
+    """
+
+    @pytest.mark.asyncio
+    async def test_run_subprocess_kills_group_on_timeout(self) -> None:
+        """TimeoutError during communicate() triggers os.killpg and proc.wait()."""
+        from openspace.grounding.backends.shell.transport.local_connector import (
+            LocalShellConnector,
+        )
+
+        connector = LocalShellConnector()
+
+        kill_calls: list = []
+        wait_calls: list = []
+
+        async def _fake_communicate():
+            raise asyncio.TimeoutError
+
+        async def _fake_wait():
+            wait_calls.append(True)
+
+        fake_proc = MagicMock()
+        fake_proc.pid = 99999
+        fake_proc.communicate = _fake_communicate
+        fake_proc.wait = _fake_wait
+
+        with patch("asyncio.create_subprocess_exec", new=AsyncMock(return_value=fake_proc)):
+            with patch("os.getpgid", return_value=99999):
+                with patch("os.killpg", side_effect=lambda pgid, sig: kill_calls.append((pgid, sig))):
+                    result = await connector._run_subprocess(["sleep", "60"], timeout=1)
+
+        assert result["status"] == "error"
+        assert "timed out" in result["output"]
+        assert result["returncode"] == -1
+        assert len(kill_calls) == 1, "killpg must be called exactly once"
+        assert len(wait_calls) == 1, "proc.wait() must be called after kill"
+
+    @pytest.mark.asyncio
+    async def test_run_subprocess_handles_already_exited_process(self) -> None:
+        """ProcessLookupError from killpg (process already gone) must not propagate."""
+        from openspace.grounding.backends.shell.transport.local_connector import (
+            LocalShellConnector,
+        )
+
+        connector = LocalShellConnector()
+
+        async def _fake_communicate():
+            raise asyncio.TimeoutError
+
+        async def _fake_wait():
+            pass
+
+        fake_proc = MagicMock()
+        fake_proc.pid = 99999
+        fake_proc.communicate = _fake_communicate
+        fake_proc.wait = _fake_wait
+
+        with patch("asyncio.create_subprocess_exec", new=AsyncMock(return_value=fake_proc)):
+            with patch("os.getpgid", return_value=99999):
+                with patch("os.killpg", side_effect=ProcessLookupError):
+                    # Must not raise — process already exited is acceptable
+                    result = await connector._run_subprocess(["sleep", "60"], timeout=1)
+
+        assert result["status"] == "error"
+        assert result["returncode"] == -1
+
+    @pytest.mark.asyncio
+    async def test_run_shell_command_kills_group_on_timeout(self) -> None:
+        """Shell command variant also kills process group on timeout."""
+        from openspace.grounding.backends.shell.transport.local_connector import (
+            LocalShellConnector,
+        )
+
+        connector = LocalShellConnector()
+
+        kill_calls: list = []
+
+        async def _fake_communicate():
+            raise asyncio.TimeoutError
+
+        async def _fake_wait():
+            pass
+
+        fake_proc = MagicMock()
+        fake_proc.pid = 88888
+        fake_proc.communicate = _fake_communicate
+        fake_proc.wait = _fake_wait
+
+        with patch("asyncio.create_subprocess_shell", new=AsyncMock(return_value=fake_proc)):
+            with patch("os.getpgid", return_value=88888):
+                with patch("os.killpg", side_effect=lambda pgid, sig: kill_calls.append(pgid)):
+                    result = await connector._run_shell_command("sleep 60", timeout=1)
+
+        assert result["status"] == "error"
+        assert "timed out" in result["output"]
+        assert len(kill_calls) == 1

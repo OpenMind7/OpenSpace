@@ -12,13 +12,19 @@ from __future__ import annotations
 
 import re
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Set
 
 from openspace.utils.logging import Logger
 
 logger = Logger.get_logger(__name__)
 
 SKILL_FILENAME = "SKILL.md"
+
+# File extensions scanned for safety violations in multi-file skills.
+# Executables, scripts, and markup that could contain injected payloads.
+_SCANNABLE_EXTENSIONS: frozenset = frozenset({
+    ".py", ".sh", ".bash", ".zsh", ".js", ".ts", ".md",
+})
 
 _SAFETY_RULES = [
     ("blocked.malware",         re.compile(r"(ClawdAuthenticatorTool)", re.IGNORECASE)),
@@ -56,6 +62,8 @@ _BLOCKING_FLAGS = frozenset({
     "blocked.malware",
     "blocked.shell_injection",
     "blocked.credential_exfil",
+    "blocked.unreadable_file",        # fail-closed: unreadable helper file
+    "blocked.unreadable_directory",   # fail-closed: unreadable skill directory
 })
 
 
@@ -65,6 +73,38 @@ def check_skill_safety(text: str) -> List[str]:
     Returns an empty list if no rules match (= safe).
     """
     return [flag for flag, pat in _SAFETY_RULES if pat.search(text)]
+
+
+def check_skill_directory_safety(skill_dir: Path) -> List[str]:
+    """Scan every text file in *skill_dir* for safety violations.
+
+    Extends ``check_skill_safety`` to cover multi-file skills: a malicious
+    helper bundled alongside ``SKILL.md`` would previously bypass the safety
+    filter (which only checked the markdown file).
+
+    Returns a deduplicated list of all triggered flag names across every
+    scannable file in the directory.  Fail-closed: returns a blocking flag if
+    the directory or any individual file is unreadable.
+
+    Only files whose extension is in ``_SCANNABLE_EXTENSIONS`` are read;
+    binary files and unknown extensions are skipped silently.
+    """
+    all_flags: List[str] = []
+    try:
+        for fpath in sorted(skill_dir.iterdir()):
+            if fpath.suffix.lower() not in _SCANNABLE_EXTENSIONS:
+                continue
+            try:
+                text = fpath.read_text(encoding="utf-8", errors="replace")
+                all_flags.extend(check_skill_safety(text))
+            except OSError:
+                all_flags.append("blocked.unreadable_file")
+    except OSError:
+        all_flags.append("blocked.unreadable_directory")
+
+    # Deduplicate while preserving first-occurrence order.
+    seen: Set[str] = set()
+    return [f for f in all_flags if not (f in seen or seen.add(f))]  # type: ignore[func-returns-value]
 
 
 def is_skill_safe(flags: List[str]) -> bool:
