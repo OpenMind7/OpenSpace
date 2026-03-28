@@ -87,9 +87,12 @@ class SkillRanker:
         rerank_cache_max_entries: int = 1024,
         rerank_cache_ttl_seconds: int = 3600,
     ) -> None:
-        # Embedding cache: skill_id → List[float]
+        # Embedding cache: "{embedding_version}:{skill_id}" → List[float]
+        # Version prefix prevents silent dim-mismatch after a fine-tune cycle.
         self._embedding_cache: Dict[str, List[float]] = {}
         self._enable_cache = enable_cache
+        # Bumped by fine_tune_from_outcomes; old cache entries auto-miss on next lookup.
+        self._embedding_version: int = 0
         # Cross-encoder (Stage 3) — lazy-loaded
         self._enable_cross_encoder = enable_cross_encoder
         self._cross_encoder_model_name = cross_encoder_model
@@ -244,8 +247,9 @@ class SkillRanker:
         if candidate.embedding:
             return candidate.embedding
 
-        # Check cache
-        cached = self._embedding_cache.get(candidate.skill_id)
+        # Check cache (version-prefixed to detect stale post-fine-tune entries)
+        _vkey = f"{self._embedding_version}:{candidate.skill_id}"
+        cached = self._embedding_cache.get(_vkey)
         if cached:
             candidate.embedding = cached
             return cached
@@ -255,19 +259,181 @@ class SkillRanker:
         emb = self._generate_embedding(text)
         if emb:
             candidate.embedding = emb
-            self._embedding_cache[candidate.skill_id] = emb
+            self._embedding_cache[_vkey] = emb
             self._save_cache()
         return emb
 
     def invalidate_cache(self, skill_id: str) -> None:
         """Remove a skill's cached embedding (e.g. after evolution)."""
-        self._embedding_cache.pop(skill_id, None)
+        self._embedding_cache.pop(f"{self._embedding_version}:{skill_id}", None)
         self._save_cache()
 
     def clear_cache(self) -> None:
         """Clear all cached embeddings."""
         self._embedding_cache.clear()
         self._save_cache()
+
+    async def fine_tune_from_outcomes(
+        self,
+        *,
+        store: Any,
+        min_new_pairs: int = 256,
+        replay_window: int = 2048,
+    ) -> bool:
+        """Fine-tune a local residual adapter using InfoNCE loss on outcome_pairs.
+
+        Residual projection: z = normalize(x + W2(GELU(W1(x))))
+        This runs ON TOP of frozen provider embeddings — not provider fine-tuning.
+
+        Returns True if fine-tuning ran, False if skipped (not enough new pairs).
+        Bumps _embedding_version on success so stale cache entries auto-invalidate.
+        """
+        import numpy as np
+
+        # 1. Determine cursor from last successful run
+        latest = store.get_latest_training_run()
+        since_id = latest["end_pair_id"] if latest else 0
+        prev_version = latest["embedding_version"] if latest else 0
+
+        # 2. Load new pairs
+        pairs = store.get_outcome_pairs_since(since_id, limit=replay_window)
+        if len(pairs) < min_new_pairs:
+            logger.debug(
+                "fine_tune_from_outcomes: only %d new pairs, need %d — skipped",
+                len(pairs), min_new_pairs,
+            )
+            return False
+
+        # 3. Collect unique skill_ids and gather their base embeddings
+        skill_ids = list({p["skill_id"] for p in pairs})
+        skill_embs: dict[str, Optional[List[float]]] = {}
+        for sid in skill_ids:
+            vkey = f"{self._embedding_version}:{sid}"
+            emb = self._embedding_cache.get(vkey)
+            if emb is None:
+                emb = self._generate_embedding(sid)  # best-effort
+            skill_embs[sid] = emb
+
+        # Drop skills without embeddings
+        skill_embs = {k: v for k, v in skill_embs.items() if v}
+        if not skill_embs:
+            logger.warning("fine_tune_from_outcomes: no embeddings available — skipped")
+            return False
+
+        dim = len(next(iter(skill_embs.values())))
+
+        # 4. Build residual adapter (W1, W2) — initialize from existing or fresh
+        adapter_key = "__adapter__"
+        adapter_data = self._embedding_cache.get(adapter_key)
+        if (
+            adapter_data is not None
+            and isinstance(adapter_data, dict)
+            and adapter_data.get("dim") == dim
+        ):
+            W1 = np.array(adapter_data["W1"], dtype=np.float32)
+            W2 = np.array(adapter_data["W2"], dtype=np.float32)
+        else:
+            # Xavier initialization — near-zero residual at start
+            scale = np.sqrt(2.0 / (dim + dim))
+            W1 = (np.random.randn(dim, dim) * scale).astype(np.float32)
+            W2 = (np.random.randn(dim, dim) * scale * 0.1).astype(np.float32)
+
+        # 5. Build training batches: (task_emb_key, skill_id, weight)
+        # For InfoNCE: applied_vs_selected (weight 1.0) = positive pairs
+        #              selected_vs_shortlist (weight 0.25) = hard negatives
+        def _apply_adapter(x: np.ndarray) -> np.ndarray:
+            """z = normalize(x + W2 @ GELU(W1 @ x))"""
+            h = W1 @ x
+            h = h * (0.5 * (1.0 + np.tanh(0.7978845608 * (h + 0.044715 * h ** 3))))  # GELU
+            z = x + W2 @ h
+            norm = np.linalg.norm(z)
+            return z / (norm + 1e-8)
+
+        # 6. SGD with InfoNCE — mini-batch gradient descent (numpy, no autograd)
+        lr = 1e-3
+        temperature = 0.07
+        n_epochs = 2
+        batch_size = 32
+
+        # Filter pairs to those with known embeddings
+        valid_pairs = [p for p in pairs if p["skill_id"] in skill_embs]
+        if len(valid_pairs) < 8:
+            logger.debug("fine_tune_from_outcomes: too few valid pairs — skipped")
+            return False
+
+        skill_mat = {sid: np.array(emb, dtype=np.float32) for sid, emb in skill_embs.items()}
+        all_sids = list(skill_mat.keys())
+
+        for _epoch in range(n_epochs):
+            np.random.shuffle(valid_pairs)  # type: ignore[arg-type]
+            for i in range(0, len(valid_pairs), batch_size):
+                batch = valid_pairs[i : i + batch_size]
+
+                # Numerical gradient for W1, W2
+                eps = 1e-4
+                grad_W1 = np.zeros_like(W1)
+                grad_W2 = np.zeros_like(W2)
+
+                for p in batch:
+                    s_emb = skill_mat[p["skill_id"]]
+                    z_anchor = _apply_adapter(s_emb)
+
+                    # Negatives: random sample of other skill embeddings
+                    neg_sids = [s for s in all_sids if s != p["skill_id"]]
+                    if not neg_sids:
+                        continue
+                    neg_sample = neg_sids[: min(8, len(neg_sids))]
+                    neg_zs = np.stack([_apply_adapter(skill_mat[s]) for s in neg_sample])
+
+                    # InfoNCE: anchor vs negatives (unsupervised: pull applied apart from non-applied)
+                    sims = neg_zs @ z_anchor / temperature
+                    softmax_denom = np.sum(np.exp(sims - sims.max())) + 1e-8
+
+                    # Approximate gradient via finite differences on W2 only (fast)
+                    for j in range(min(dim, 16)):  # sparse probe
+                        for k in range(min(dim, 16)):
+                            W2[j, k] += eps
+                            z_plus = _apply_adapter(s_emb)
+                            sims_plus = neg_zs @ z_plus / temperature
+                            loss_plus = -sims_plus[0] + np.log(
+                                np.sum(np.exp(sims_plus - sims_plus.max())) + 1e-8
+                            )
+                            W2[j, k] -= eps
+                            sims_orig = neg_zs @ z_anchor / temperature
+                            loss_orig = -sims_orig[0] + np.log(softmax_denom)
+                            grad_W2[j, k] += (loss_plus - loss_orig) / eps * p["weight"]
+
+                W2 -= lr * grad_W2
+
+        # 7. Recompute and re-cache all skill embeddings with new adapter
+        new_version = prev_version + 1
+        for sid, base_emb in skill_mat.items():
+            adapted = _apply_adapter(base_emb).tolist()
+            self._embedding_cache[f"{new_version}:{sid}"] = adapted
+
+        # Save adapter alongside embeddings
+        self._embedding_cache[adapter_key] = {
+            "dim": dim,
+            "version": new_version,
+            "W1": W1.tolist(),
+            "W2": W2.tolist(),
+        }
+        self._embedding_version = new_version
+        self._save_cache()
+
+        # 8. Record training run in store
+        end_pair_id = pairs[-1]["id"] if pairs else since_id
+        await store.record_training_run(
+            embedding_version=new_version,
+            end_pair_id=end_pair_id,
+            status="complete",
+        )
+
+        logger.info(
+            "fine_tune_from_outcomes: trained on %d pairs → embedding_version=%d",
+            len(valid_pairs), new_version,
+        )
+        return True
 
     @staticmethod
     def _tokenize(text: str) -> List[str]:
@@ -363,7 +529,8 @@ class SkillRanker:
         # Ensure all candidates have embeddings
         for c in candidates:
             if not c.embedding:
-                cached = self._embedding_cache.get(c.skill_id)
+                _vkey = f"{self._embedding_version}:{c.skill_id}"
+                cached = self._embedding_cache.get(_vkey)
                 if cached:
                     c.embedding = cached
                 else:
@@ -371,7 +538,7 @@ class SkillRanker:
                     emb = self._generate_embedding(text, api_key=api_key)
                     if emb:
                         c.embedding = emb
-                        self._embedding_cache[c.skill_id] = emb
+                        self._embedding_cache[_vkey] = emb
 
         # Save newly computed embeddings
         self._save_cache()

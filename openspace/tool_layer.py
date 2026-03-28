@@ -745,6 +745,13 @@ class OpenSpace:
         else:
             selected = selected[:max_select]  # no TS — take top max_select directly
 
+        # Rewrite selection_record["selected"] to reflect final injected set.
+        # TS pool expansion passes ts_pool_size to the LLM, so the registry writes
+        # up to 6 skill IDs into the record; after TS truncation only max_select are
+        # actually injected. Analyzer trusts this field as the injected-skill list.
+        if selection_record:
+            selection_record["selected"] = [s.skill_id for s in selected]
+
         # Record skill selection to metadata.json
         if self._recording_manager and selection_record:
             # Add model info to the record

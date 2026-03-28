@@ -293,6 +293,12 @@ class SkillEvolver:
                 label=f"bandit_update:{analysis.task_id}",
             )
 
+        # W6-P2: Periodic InfoNCE fine-tune trigger (de-duped by label)
+        self.schedule_background(
+            self._fine_tune_from_outcomes_bg(),
+            label="fine_tune_embeddings",
+        )
+
         if not analysis.candidate_for_evolution:
             return []
 
@@ -347,6 +353,21 @@ class SkillEvolver:
                 await self._store.update_bandit(judgment.skill_id, reward=reward)
             except Exception as exc:
                 logger.debug("Bandit update failed for %s: %s", judgment.skill_id, exc)
+
+    async def _fine_tune_from_outcomes_bg(self) -> None:
+        """W6-P2: Background — run InfoNCE contrastive fine-tuning when enough pairs exist.
+
+        De-duplicated via schedule_background label 'fine_tune_embeddings' so only one
+        fine-tune cycle runs at a time regardless of how often process_analysis fires.
+        """
+        try:
+            async with self._semaphore:
+                ranker = self._registry.ranker
+                ran = await ranker.fine_tune_from_outcomes(store=self._store)
+                if ran:
+                    logger.info("Embedding fine-tune complete (version=%d)", ranker._embedding_version)
+        except Exception as exc:
+            logger.debug("Fine-tune from outcomes failed (non-fatal): %s", exc)
 
     async def _distill_failure(self, analysis: ExecutionAnalysis) -> None:
         """Distill a FailureLesson from a failed task execution.

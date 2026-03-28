@@ -213,10 +213,10 @@ class TestDistillFailure:
 
         with patch.object(evolver, "schedule_background") as mock_sched:
             await evolver.process_analysis(analysis)
-            mock_sched.assert_called_once()
-            # Verify the label contains distill_failure
-            call_kwargs = mock_sched.call_args
-            assert call_kwargs.kwargs.get("label", "").startswith("distill_failure:")
+            # distill_failure_bg fires on failed tasks; fine_tune_embeddings always fires
+            labels = [c.kwargs.get("label", "") for c in mock_sched.call_args_list]
+            distill_labels = [l for l in labels if l.startswith("distill_failure:")]
+            assert len(distill_labels) == 1, f"Expected 1 distill call, got: {labels}"
 
     @pytest.mark.asyncio
     async def test_distill_not_triggered_on_success(self):
@@ -227,7 +227,10 @@ class TestDistillFailure:
         with patch.object(evolver, "schedule_background") as mock_sched:
             await evolver.process_analysis(analysis)
 
-        mock_sched.assert_not_called()
+        # distill_failure_bg must NOT fire on success; fine_tune_embeddings may still fire
+        labels = [c.kwargs.get("label", "") for c in mock_sched.call_args_list]
+        distill_labels = [l for l in labels if l.startswith("distill_failure:")]
+        assert len(distill_labels) == 0, f"distill_failure must not fire on success, got: {labels}"
 
     @pytest.mark.asyncio
     async def test_confidence_gate_skips_low_confidence(self):

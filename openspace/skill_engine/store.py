@@ -221,6 +221,30 @@ CREATE TABLE IF NOT EXISTS skill_causal_attributions (
 );
 CREATE INDEX IF NOT EXISTS idx_sca_analysis ON skill_causal_attributions(analysis_id);
 CREATE INDEX IF NOT EXISTS idx_sca_skill    ON skill_causal_attributions(skill_id);
+
+-- W6-P2: outcome_pairs — contrastive embedding fine-tuning data collection
+-- pair_type: applied_vs_selected (weight 1.0) | selected_vs_shortlist (weight 0.25)
+CREATE TABLE IF NOT EXISTS outcome_pairs (
+    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+    analysis_id         INTEGER NOT NULL REFERENCES execution_analyses(id) ON DELETE CASCADE,
+    task_embedding_key  TEXT    NOT NULL,
+    skill_id            TEXT    NOT NULL,
+    pair_type           TEXT    NOT NULL,
+    weight              REAL    NOT NULL DEFAULT 1.0,
+    created_at          TEXT    NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_op_analysis ON outcome_pairs(analysis_id);
+CREATE INDEX IF NOT EXISTS idx_op_created  ON outcome_pairs(created_at);
+
+-- W6-P2: embedding_training_runs — tracks InfoNCE fine-tune version cursor
+CREATE TABLE IF NOT EXISTS embedding_training_runs (
+    id                INTEGER PRIMARY KEY AUTOINCREMENT,
+    embedding_version INTEGER NOT NULL DEFAULT 0,
+    end_pair_id       INTEGER NOT NULL DEFAULT 0,
+    status            TEXT    NOT NULL DEFAULT 'pending',
+    created_at        TEXT    NOT NULL,
+    completed_at      TEXT
+);
 """
 
 
@@ -1393,6 +1417,59 @@ class SkillStore:
             )
             self._conn.commit()
 
+    # --- Contrastive Embedding Training (W6-P2) ---
+
+    def get_outcome_pairs_since(
+        self, since_pair_id: int, limit: int = 2048
+    ) -> List[dict]:
+        """Return up to *limit* outcome_pairs with id > since_pair_id."""
+        with self._reader() as conn:
+            rows = conn.execute(
+                "SELECT id, analysis_id, task_embedding_key, skill_id, pair_type, weight "
+                "FROM outcome_pairs WHERE id > ? ORDER BY id LIMIT ?",
+                (since_pair_id, limit),
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    def get_latest_training_run(self) -> Optional[dict]:
+        """Return the most recent completed embedding_training_runs row, or None."""
+        with self._reader() as conn:
+            row = conn.execute(
+                "SELECT id, embedding_version, end_pair_id, status "
+                "FROM embedding_training_runs "
+                "WHERE status = 'complete' "
+                "ORDER BY id DESC LIMIT 1",
+            ).fetchone()
+        return dict(row) if row else None
+
+    async def record_training_run(
+        self,
+        *,
+        embedding_version: int,
+        end_pair_id: int,
+        status: str = "complete",
+    ) -> int:
+        """Insert a new embedding_training_runs row and return its id."""
+        return await asyncio.to_thread(
+            self._record_training_run_sync, embedding_version, end_pair_id, status
+        )
+
+    @_db_retry()
+    def _record_training_run_sync(
+        self, embedding_version: int, end_pair_id: int, status: str
+    ) -> int:
+        now_iso = datetime.now().isoformat()
+        with self._mu:
+            cur = self._conn.execute(
+                "INSERT INTO embedding_training_runs "
+                "(embedding_version, end_pair_id, status, created_at, completed_at) "
+                "VALUES (?,?,?,?,?)",
+                (embedding_version, end_pair_id, status, now_iso,
+                 now_iso if status == "complete" else None),
+            )
+            self._conn.commit()
+            return cur.lastrowid
+
     # Maintenance
     def clear(self) -> None:
         """Delete all data (keeps schema)."""
@@ -1408,6 +1485,7 @@ class SkillStore:
                 self._conn.execute("DELETE FROM failure_lessons")
                 self._conn.execute("DELETE FROM skill_bandit")
                 self._conn.execute("DELETE FROM skill_dispatch_events")
+                self._conn.execute("DELETE FROM embedding_training_runs")
                 self._conn.commit()
                 logger.info("SkillStore cleared")
             except Exception:
@@ -1606,6 +1684,20 @@ class SkillStore:
                     ca.bandit_reward,
                     ca.confidence,
                 ),
+            )
+
+        # W6-P2: materialize outcome_pairs for InfoNCE contrastive embedding training.
+        # applied_vs_selected (weight 1.0): positive signal — skill was actually used.
+        # selected_vs_shortlist (weight 0.25): hard negative — selected but never applied.
+        now_p2 = datetime.now().isoformat()
+        for j in a.skill_judgments:
+            pair_type = "applied_vs_selected" if j.skill_applied else "selected_vs_shortlist"
+            weight = 1.0 if j.skill_applied else 0.25
+            self._conn.execute(
+                "INSERT INTO outcome_pairs "
+                "(analysis_id, task_embedding_key, skill_id, pair_type, weight, created_at) "
+                "VALUES (?,?,?,?,?,?)",
+                (analysis_id, a.task_id, j.skill_id, pair_type, weight, now_p2),
             )
 
         return analysis_id
