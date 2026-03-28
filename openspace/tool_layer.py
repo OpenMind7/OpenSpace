@@ -692,6 +692,7 @@ class OpenSpace:
                 llm_client=skill_llm,
                 max_skills=max_select,
                 skill_quality=skill_quality,
+                store=self._skill_store,
             )
         else:
             # No LLM client — skip skill selection entirely

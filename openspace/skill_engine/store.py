@@ -1192,35 +1192,50 @@ class SkillStore:
     def get_recent_failure_lessons(
         self, skill_ids: List[str], limit: int = 5
     ) -> List["FailureLesson"]:
-        """Return recent non-expired lessons, preferring those matching *skill_ids*."""
+        """Return recent non-expired lessons, preferring those matching *skill_ids*.
+
+        Uses a two-pass query: first fetch skill-matched lessons (highest relevance),
+        then pad remaining slots from global recency. This prevents older but relevant
+        lessons from being cut off by a large corpus of unrelated recent failures.
+        """
         from openspace.skill_engine.types import FailureLesson
         now_iso = datetime.now().isoformat()
-        with self._reader() as conn:
-            rows = conn.execute(
-                """
-                SELECT * FROM failure_lessons
-                WHERE (expires_at IS NULL OR expires_at > ?)
-                ORDER BY created_at DESC
-                LIMIT ?
-                """,
-                (now_iso, limit * 3),
-            ).fetchall()
-        lessons = [
+        matched_ids: set = set()
+        all_rows = []
+
+        if skill_ids:
+            like_clauses = " OR ".join("skill_ids LIKE ?" for _ in skill_ids)
+            like_params = [f"%{sid}%" for sid in skill_ids]
+            with self._reader() as conn:
+                matched = conn.execute(
+                    f"SELECT * FROM failure_lessons "
+                    f"WHERE (expires_at IS NULL OR expires_at > ?) AND ({like_clauses}) "
+                    f"ORDER BY created_at DESC LIMIT ?",
+                    [now_iso] + like_params + [limit],
+                ).fetchall()
+            all_rows = list(matched)
+            matched_ids = {r["lesson_id"] for r in matched}
+
+        # Fill remaining slots from global recency (excluding already-matched)
+        remaining = limit - len(all_rows)
+        if remaining > 0:
+            with self._reader() as conn:
+                global_rows = conn.execute(
+                    "SELECT * FROM failure_lessons "
+                    "WHERE (expires_at IS NULL OR expires_at > ?) "
+                    "ORDER BY created_at DESC LIMIT ?",
+                    (now_iso, remaining + len(matched_ids)),
+                ).fetchall()
+            all_rows += [r for r in global_rows if r["lesson_id"] not in matched_ids][:remaining]
+
+        return [
             FailureLesson.from_dict({
                 **dict(r),
                 "skill_ids": json.loads(r["skill_ids"]),
                 "tool_culprits": json.loads(r["tool_culprits"]),
             })
-            for r in rows
+            for r in all_rows[:limit]
         ]
-        # Prefer lessons that overlap with the candidate skill_ids
-        sid_set = set(skill_ids)
-        scored = sorted(
-            lessons,
-            key=lambda l: (bool(set(l.skill_ids) & sid_set), l.created_at),
-            reverse=True,
-        )
-        return scored[:limit]
 
     async def prune_expired_failure_lessons(self) -> int:
         """Delete expired failure lessons. Returns number of rows removed."""

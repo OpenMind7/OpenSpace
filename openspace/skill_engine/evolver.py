@@ -281,9 +281,9 @@ class SkillEvolver:
         """
         # Distill failure lesson independently of evolution suggestions
         if not analysis.task_completed:
-            asyncio.create_task(
+            self.schedule_background(
                 self._distill_failure_bg(analysis),
-                name=f"distill_failure:{analysis.task_id}",
+                label=f"distill_failure:{analysis.task_id}",
             )
 
         if not analysis.candidate_for_evolution:

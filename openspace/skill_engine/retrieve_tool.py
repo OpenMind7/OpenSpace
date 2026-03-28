@@ -78,6 +78,7 @@ class RetrieveSkillTool(LocalTool):
                 llm_client=self._llm_client,
                 max_skills=1,
                 skill_quality=quality,
+                store=self._skill_store,
             )
             if record:
                 plan = record.get("brief_plan", "")

@@ -211,14 +211,12 @@ class TestDistillFailure:
         evolver = make_evolver()
         analysis = make_analysis(task_completed=False)
 
-        with patch.object(evolver, "_distill_failure_bg", new_callable=AsyncMock) as mock_bg:
-            # process_analysis uses create_task; patch at asyncio level
-            with patch("asyncio.create_task") as mock_create:
-                await evolver.process_analysis(analysis)
-            mock_create.assert_called_once()
-            # Verify the coroutine name contains distill_failure
-            call_kwargs = mock_create.call_args
-            assert call_kwargs.kwargs.get("name", "").startswith("distill_failure:")
+        with patch.object(evolver, "schedule_background") as mock_sched:
+            await evolver.process_analysis(analysis)
+            mock_sched.assert_called_once()
+            # Verify the label contains distill_failure
+            call_kwargs = mock_sched.call_args
+            assert call_kwargs.kwargs.get("label", "").startswith("distill_failure:")
 
     @pytest.mark.asyncio
     async def test_distill_not_triggered_on_success(self):
@@ -226,10 +224,10 @@ class TestDistillFailure:
         evolver = make_evolver()
         analysis = make_analysis(task_completed=True)
 
-        with patch("asyncio.create_task") as mock_create:
+        with patch.object(evolver, "schedule_background") as mock_sched:
             await evolver.process_analysis(analysis)
 
-        mock_create.assert_not_called()
+        mock_sched.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_confidence_gate_skips_low_confidence(self):
