@@ -28,49 +28,54 @@ class BaseConnector(ABC, Generic[T]):
         # The raw connection object returned by the manager, for reusing the established long-term connection
         self._connection: T | None = None
         self._connected = False
+        # Serialise connect/disconnect to prevent TOCTOU race: two concurrent callers
+        # both seeing _connected=False and each spawning a separate session.
+        self._connect_lock = asyncio.Lock()
 
     async def connect(self) -> None:
         """Create the underlying session/connection via the manager."""
-        if self._connected:
-            return
-        
-        try:
-            # Hook: before connection
-            await self._before_connect()
-            
-            # Start the connection manager
-            self._connection = await self._connection_manager.start()
-            
-            # Hook: after connection established
-            await self._after_connect()
-            
-            # Mark as connected
-            self._connected = True
-        except Exception:
-            # Clean up on failure
-            await self._cleanup_on_connect_failure()
-            raise
+        async with self._connect_lock:
+            if self._connected:
+                return
+
+            try:
+                # Hook: before connection
+                await self._before_connect()
+
+                # Start the connection manager
+                self._connection = await self._connection_manager.start()
+
+                # Hook: after connection established
+                await self._after_connect()
+
+                # Mark as connected
+                self._connected = True
+            except Exception:
+                # Clean up on failure
+                await self._cleanup_on_connect_failure()
+                raise
 
     async def disconnect(self) -> None:
         """Close the session/connection and reset state.
-        
+
         Ensures proper cleanup of all resources including aiohttp sessions.
         """
-        if not self._connected:
-            return
-        
-        # Hook: before disconnection
-        await self._before_disconnect()
-        
-        # Stop the connection manager
-        if self._connection_manager:
-            await self._connection_manager.stop()
-            self._connection = None
-        
-        # Hook: after disconnection
-        await self._after_disconnect()
-        
-        self._connected = False
+        async with self._connect_lock:
+            if not self._connected:
+                return
+
+            # Hook: before disconnection
+            await self._before_disconnect()
+
+            # Stop the connection manager
+            if self._connection_manager:
+                await self._connection_manager.stop()
+                self._connection = None
+
+            # Hook: after disconnection
+            await self._after_disconnect()
+
+            self._connected = False
 
     async def _before_connect(self) -> None:
         """Hook called before establishing connection. Override in subclasses if needed."""

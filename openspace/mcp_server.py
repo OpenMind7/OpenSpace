@@ -23,6 +23,7 @@ import logging
 import os
 import sys
 import traceback
+import uuid
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -493,6 +494,19 @@ def _json_error(error: Any, **extra) -> str:
     return json.dumps({"error": str(error), **extra}, ensure_ascii=False)
 
 
+def _opaque_error(label: str, exc: Exception, **extra) -> str:
+    """Log *exc* with a correlation ref-ID; return only the opaque ref to the caller.
+
+    Prevents internal file paths, class names, and tracebacks from leaking
+    to MCP tool callers. The ref-ID lets operators correlate the response
+    with the server-side log entry.
+    """
+    error_id = uuid.uuid4().hex[:8]
+    logger.error("[ref:%s] %s: %s", error_id, label, exc, exc_info=exc)
+    return json.dumps({"error": f"Internal error (ref:{error_id})", **extra}, ensure_ascii=False)
+
+
+
 # MCP Tools (4 tools)
 @mcp.tool()
 async def execute_task(
@@ -592,8 +606,7 @@ async def execute_task(
             return _json_ok(formatted)
 
         except Exception as e:
-            logger.error(f"execute_task failed: {e}", exc_info=True)
-            return _json_error(e, status="error")
+            return _opaque_error("execute_task", e, status="error")
 
 
 @mcp.tool()
@@ -710,8 +723,7 @@ async def search_skills(
         return _json_ok(output)
 
     except Exception as e:
-        logger.error(f"search_skills failed: {e}", exc_info=True)
-        return _json_error(e)
+        return _opaque_error("search_skills", e)
 
 
 @mcp.tool()
@@ -834,8 +846,7 @@ async def fix_skill(
         })
 
     except Exception as e:
-        logger.error(f"fix_skill failed: {e}", exc_info=True)
-        return _json_error(e, status="error")
+        return _opaque_error("fix_skill", e, status="error")
 
 
 @mcp.tool()
@@ -919,8 +930,7 @@ async def upload_skill(
         return _json_ok(result)
 
     except Exception as e:
-        logger.error(f"upload_skill failed: {e}", exc_info=True)
-        return _json_error(e, status="error")
+        return _opaque_error("upload_skill", e, status="error")
 
 def run_mcp_server() -> None:
     """Console-script entry point for ``openspace-mcp``."""

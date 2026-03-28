@@ -536,11 +536,24 @@ class SkillEvolver:
         Used by the caller (``OpenSpace._maybe_evolve_quality``) when
         ``background_triggers`` is True.  The task is tracked so it can
         be awaited on shutdown via ``wait_background()``.
+
+        If an in-flight task with the same *label* already exists the new
+        coroutine is discarded (closed) to prevent duplicate concurrent
+        evolution work on the same trigger.
         """
         try:
             loop = asyncio.get_running_loop()
         except RuntimeError:
             logger.warning(f"No running event loop — cannot schedule {label}")
+            return None
+
+        # De-duplicate: if a same-label task is still running, discard the new one.
+        if any(t.get_name() == label and not t.done() for t in self._background_tasks):
+            logger.debug(
+                f"[schedule_background] '{label}' already in flight — "
+                "discarding duplicate to prevent overlap"
+            )
+            coro.close()  # prevent 'coroutine was never awaited' ResourceWarning
             return None
 
         task = loop.create_task(coro, name=label)
