@@ -52,6 +52,8 @@ from .skill_utils import (
     strip_markdown_fences as _strip_markdown_fences,
     truncate as _truncate,
     validate_skill_dir as _validate_skill_dir,
+    check_skill_safety as _check_skill_safety,
+    is_skill_safe as _is_skill_safe,
 )
 from .registry import write_skill_id
 from .store import SkillStore
@@ -1280,11 +1282,26 @@ class SkillEvolver:
                 # Validate the result
                 validation_error = _validate_skill_dir(skill_dir)
                 if validation_error is None:
-                    if attempt > 0:
-                        logger.info(
-                            f"Apply-retry succeeded on attempt {attempt + 1}/{_MAX_EVOLUTION_ATTEMPTS}"
+                    # Post-evolution safety re-scan: reject unsafe evolved content
+                    skill_content = (skill_dir / SKILL_FILENAME).read_text(encoding="utf-8")
+                    safety_flags = _check_skill_safety(skill_content)
+                    if not _is_skill_safe(safety_flags):
+                        blocking = [f for f in safety_flags if f.startswith("blocked.")]
+                        logger.error(
+                            f"Post-evolution safety BLOCKED: {blocking} — "
+                            f"rejecting evolved skill in {skill_dir}"
                         )
-                    return edit_result
+                        error_msg = f"Safety re-scan blocked: {blocking}"
+                    else:
+                        if safety_flags:
+                            logger.warning(
+                                f"Post-evolution safety flags (non-blocking): {safety_flags}"
+                            )
+                        if attempt > 0:
+                            logger.info(
+                                f"Apply-retry succeeded on attempt {attempt + 1}/{_MAX_EVOLUTION_ATTEMPTS}"
+                            )
+                        return edit_result
                 else:
                     # Validation failed — treat as error for retry
                     error_msg = f"Validation failed: {validation_error}"

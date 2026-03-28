@@ -22,6 +22,28 @@ SKILL_FILENAME = "SKILL.md"
 
 _SAFETY_RULES = [
     ("blocked.malware",         re.compile(r"(ClawdAuthenticatorTool)", re.IGNORECASE)),
+    # Shell injection: detect patterns that execute arbitrary shell commands
+    ("blocked.shell_injection", re.compile(
+        r"(?:"
+        r"(?:bash|sh|zsh)\s+-c\s+"          # bash -c "..."
+        r"|subprocess\.(?:call|run|Popen)"   # Python subprocess
+        r"|os\.(?:system|popen|exec[lv]?p?)" # os.system / os.popen / os.exec*
+        r"|\beval\s*\([^)]*(?:input|argv|arg|param|request|query)"  # eval(user_input)
+        r"|\bexec\s*\([^)]*(?:input|argv|arg|param|request|query)"  # exec(user_input)
+        r"|__import__\s*\(\s*['\"](?:subprocess|shutil|ctypes)"     # __import__('subprocess')
+        r")",
+        re.IGNORECASE,
+    )),
+    # Credential exfiltration: detect attempts to read secrets or env vars
+    ("blocked.credential_exfil", re.compile(
+        r"(?:"
+        r"os\.environ\s*\[.*(?:KEY|TOKEN|SECRET|PASSWORD|CREDENTIAL)"  # os.environ["API_KEY"]
+        r"|open\s*\(.*(?:\.ssh|\.aws|\.gnupg|credentials|shadow|passwd)"  # open("~/.ssh/...")
+        r"|(?:curl|wget|fetch|requests\.(?:get|post))\s*.*(?:webhook|exfil|ngrok|burp)"  # exfiltration via HTTP
+        r"|base64\.b64encode.*(?:key|token|secret|password)"  # base64 encode secrets
+        r")",
+        re.IGNORECASE,
+    )),
     ("suspicious.keyword",      re.compile(r"(malware|stealer|phish|phishing|keylogger)", re.IGNORECASE)),
     ("suspicious.secrets",      re.compile(r"(api[-_ ]?key|token|password|private key|secret)", re.IGNORECASE)),
     ("suspicious.crypto",       re.compile(r"(wallet|seed phrase|mnemonic|crypto)", re.IGNORECASE)),
@@ -30,7 +52,11 @@ _SAFETY_RULES = [
     ("suspicious.url_shortener", re.compile(r"(bit\.ly|tinyurl\.com|t\.co|goo\.gl|is\.gd)", re.IGNORECASE)),
 ]
 
-_BLOCKING_FLAGS = frozenset({"blocked.malware"})
+_BLOCKING_FLAGS = frozenset({
+    "blocked.malware",
+    "blocked.shell_injection",
+    "blocked.credential_exfil",
+})
 
 
 def check_skill_safety(text: str) -> List[str]:

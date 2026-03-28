@@ -120,6 +120,11 @@ _openspace_instance = None
 _openspace_lock = asyncio.Lock()
 _standalone_store = None
 
+# Concurrency + timeout controls (configurable via env vars)
+_TASK_TIMEOUT = int(os.environ.get("OPENSPACE_TASK_TIMEOUT", "600"))
+_MAX_CONCURRENT = int(os.environ.get("OPENSPACE_MAX_CONCURRENT", "3"))
+_task_semaphore = asyncio.Semaphore(_MAX_CONCURRENT)
+
 # Internal state: tracks bot skill directories already registered this session.
 _registered_skill_dirs: set = set()
 
@@ -517,47 +522,58 @@ async def execute_task(
                       if no API key is configured.
                       "local" — local SkillRegistry only (fast, no cloud).
     """
-    try:
-        openspace = await _get_openspace()
+    async with _task_semaphore:
+        try:
+            openspace = await _get_openspace()
 
-        # Re-scan host skill directories (from env) to pick up skills
-        # created by the host bot since the last call.
-        host_skill_dirs_raw = os.environ.get("OPENSPACE_HOST_SKILL_DIRS", "")
-        if host_skill_dirs_raw:
-            env_dirs = [d.strip() for d in host_skill_dirs_raw.split(",") if d.strip()]
-            if env_dirs:
-                await _auto_register_skill_dirs(env_dirs)
+            # Re-scan host skill directories (from env) to pick up skills
+            # created by the host bot since the last call.
+            host_skill_dirs_raw = os.environ.get("OPENSPACE_HOST_SKILL_DIRS", "")
+            if host_skill_dirs_raw:
+                env_dirs = [d.strip() for d in host_skill_dirs_raw.split(",") if d.strip()]
+                if env_dirs:
+                    await _auto_register_skill_dirs(env_dirs)
 
-        # Auto-register bot skill directories (from call parameter)
-        if skill_dirs:
-            await _auto_register_skill_dirs(skill_dirs)
+            # Auto-register bot skill directories (from call parameter)
+            if skill_dirs:
+                await _auto_register_skill_dirs(skill_dirs)
 
-        # Cloud search + import (if requested)
-        imported_skills: List[Dict[str, Any]] = []
-        if search_scope == "all":
-            imported_skills = await _cloud_search_and_import(task)
+            # Cloud search + import (if requested)
+            imported_skills: List[Dict[str, Any]] = []
+            if search_scope == "all":
+                imported_skills = await _cloud_search_and_import(task)
 
-        # Execute
-        result = await openspace.execute(
-            task=task,
-            workspace_dir=workspace_dir,
-            max_iterations=max_iterations,
-        )
+            # Execute with timeout guard
+            try:
+                result = await asyncio.wait_for(
+                    openspace.execute(
+                        task=task,
+                        workspace_dir=workspace_dir,
+                        max_iterations=max_iterations,
+                    ),
+                    timeout=_TASK_TIMEOUT,
+                )
+            except asyncio.TimeoutError:
+                logger.error(f"execute_task timed out after {_TASK_TIMEOUT}s")
+                return _json_error(
+                    f"Task execution timed out after {_TASK_TIMEOUT} seconds",
+                    status="timeout",
+                )
 
-        # Write .upload_meta.json for each evolved skill
-        for es in result.get("evolved_skills", []):
-            skill_path = es.get("path", "")
-            if skill_path:
-                _write_upload_meta(Path(skill_path).parent, es)
+            # Write .upload_meta.json for each evolved skill
+            for es in result.get("evolved_skills", []):
+                skill_path = es.get("path", "")
+                if skill_path:
+                    _write_upload_meta(Path(skill_path).parent, es)
 
-        formatted = _format_task_result(result)
-        if imported_skills:
-            formatted["imported_skills"] = imported_skills
-        return _json_ok(formatted)
+            formatted = _format_task_result(result)
+            if imported_skills:
+                formatted["imported_skills"] = imported_skills
+            return _json_ok(formatted)
 
-    except Exception as e:
-        logger.error(f"execute_task failed: {e}", exc_info=True)
-        return _json_error(e, status="error")
+        except Exception as e:
+            logger.error(f"execute_task failed: {e}", exc_info=True)
+            return _json_error(e, status="error")
 
 
 @mcp.tool()
