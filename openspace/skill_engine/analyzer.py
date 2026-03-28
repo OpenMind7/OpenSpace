@@ -24,6 +24,7 @@ from typing import Any, Dict, List, Optional, TYPE_CHECKING
 from openspace.grounding.core.tool import BaseTool
 
 from .types import (
+    CausalAttribution,
     EvolutionSuggestion,
     EvolutionType,
     ExecutionAnalysis,
@@ -212,6 +213,9 @@ class ExecutionAnalyzer:
             analysis = self._parse_analysis(task_id, raw_json, context)
             if analysis is None:
                 return None
+
+            # 4.5 W6-P3: Abduct-Act-Predict causal attribution (sync, traj still in memory)
+            analysis.causal_attributions = await self._run_causal_aap(analysis, context)
 
             # 5. Persist
             await self._store.record_analysis(analysis)
@@ -979,6 +983,135 @@ class ExecutionAnalyzer:
         except Exception as e:
             logger.error(f"Failed to parse analysis response: {e}")
             return None
+
+    async def _run_causal_aap(
+        self,
+        analysis: ExecutionAnalysis,
+        context: Dict[str, Any],
+    ) -> List[CausalAttribution]:
+        """W6-P3: Abduct-Act-Predict causal attribution for each judged skill.
+
+        Runs a single LLM call (all skills in one prompt) while the full traj
+        is still in memory. Returns an empty list if the LLM call fails or
+        there are no skill judgments — callers must treat attribution as optional.
+
+        Scores:
+            abductive_score  — P(this skill caused the outcome)
+            act_score        — P(the counterfactual would have worked)
+            predict_score    — P(this analysis is correct)
+            causal_score     — abductive × act × predict
+            bandit_reward    — signed in [-1, 1]: +causal_score if helped, -causal_score if hurt
+        """
+        import json as _json
+        import re as _re
+
+        if not analysis.skill_judgments:
+            return []
+
+        model = self._model or self._llm_client.model
+
+        # Summarize the traj for the prompt
+        traj_section = self._format_traj_summary(context.get("traj_records", []))
+        skill_lines = "\n".join(
+            f"- skill_id={j.skill_id}, applied={j.skill_applied}, note={j.note!r}"
+            for j in analysis.skill_judgments
+        )
+
+        prompt = f"""You are a causal analysis expert. A task just completed with these results:
+
+Task outcome: {"SUCCEEDED" if analysis.task_completed else "FAILED"}
+Execution note: {analysis.execution_note or "(none)"}
+Tool issues: {", ".join(analysis.tool_issues) or "(none)"}
+
+Skills that were active:
+{skill_lines}
+
+Tool execution trace:
+{traj_section}
+
+For each skill, apply the Abduct-Act-Predict framework:
+- Abduct: What root cause (if any) connects this skill to the outcome?
+- Act: If this skill was the cause, what counterfactual tool sequence would have produced a better outcome?
+- Predict: How confident are you that your attribution is correct?
+
+Return a JSON ARRAY with one entry per skill:
+[
+  {{
+    "skill_id": "<exact skill_id from the list above>",
+    "outcome_role": "helped" | "hurt" | "neutral",
+    "summary": "<one sentence: how this skill affected the outcome>",
+    "counterfactual": "<what should have happened differently, or empty if neutral>",
+    "evidence_steps": ["<tool call step that supports this claim>"],
+    "tool_keys": ["<tool name involved>"],
+    "failure_mode": "<one of: wrong_tool_sequence|api_misuse|missing_prerequisite|scope_creep|auth_error|rate_limit|data_format|other|> or empty if not applicable",
+    "abductive_score": 0.0-1.0,
+    "act_score": 0.0-1.0,
+    "predict_score": 0.0-1.0,
+    "confidence": 0.0-1.0
+  }}
+]
+Return ONLY the JSON array, no other text."""
+
+        try:
+            result = await self._llm_client.complete(
+                messages=[{"role": "user", "content": prompt}],
+                model=model,
+            )
+            content = result["message"].get("content", "")
+        except Exception as exc:
+            logger.debug("AAP LLM call failed (non-fatal): %s", exc)
+            return []
+
+        # Parse JSON array
+        m = _re.search(r"\[.*\]", content, _re.DOTALL)
+        if not m:
+            logger.debug("AAP: no JSON array in response")
+            return []
+        try:
+            raw_list = _json.loads(m.group())
+        except Exception:
+            return []
+
+        attributions: List[CausalAttribution] = []
+        known_ids = {j.skill_id for j in analysis.skill_judgments}
+        for item in raw_list:
+            if not isinstance(item, dict):
+                continue
+            sid = item.get("skill_id", "")
+            if sid not in known_ids:
+                # Try fuzzy correction
+                corrected = _correct_skill_ids([sid], known_ids)
+                sid = corrected[0] if corrected else sid
+            abductive = float(item.get("abductive_score", 0.0))
+            act = float(item.get("act_score", 0.0))
+            predict = float(item.get("predict_score", 0.0))
+            causal = abductive * act * predict
+            role = item.get("outcome_role", "neutral")
+            # Signed bandit reward: positive for helping, negative for hurting
+            if role == "helped":
+                reward = causal
+            elif role == "hurt":
+                reward = -causal
+            else:
+                reward = 0.0
+            attributions.append(CausalAttribution(
+                skill_id=sid,
+                outcome_role=role,
+                summary=item.get("summary", ""),
+                counterfactual=item.get("counterfactual", ""),
+                evidence_steps=item.get("evidence_steps", []),
+                tool_keys=item.get("tool_keys", []),
+                failure_mode=item.get("failure_mode", ""),
+                abductive_score=abductive,
+                act_score=act,
+                predict_score=predict,
+                causal_score=causal,
+                bandit_reward=reward,
+                confidence=float(item.get("confidence", 0.0)),
+            ))
+
+        logger.debug("AAP: %d causal attributions computed for task %s", len(attributions), analysis.task_id)
+        return attributions
 
     # Convenience queries (delegated to store)
     def get_store(self) -> SkillStore:

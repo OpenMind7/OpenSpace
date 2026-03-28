@@ -704,18 +704,24 @@ class OpenSpace:
             except Exception as e:
                 logger.debug(f"Could not load skill quality metrics: {e}")
 
+        # Request a larger pool for TS exploration. With only max_select=2 candidates the
+        # hybrid score gap (0.5) exceeds the max TS delta (0.25 × 1.0 = 0.25), making
+        # reordering mathematically impossible. Fetching 3× allows TS to promote lower-ranked
+        # candidates; final truncation to max_select happens inside ts_blend_reorder.
+        ts_pool_size = max(max_select * 3, 5)
+
         if skill_llm:
             selected, selection_record = await self._skill_registry.select_skills_with_llm(
                 task,
                 llm_client=skill_llm,
-                max_skills=max_select,
+                max_skills=ts_pool_size,
                 skill_quality=skill_quality,
                 store=self._skill_store,
             )
         else:
             # No LLM client — use local prefilter (BM25+embedding, Stage 3 if enabled)
             logger.info("No LLM client available for skill selection — using local prefilter")
-            selected = self._skill_registry.select_skills_without_llm(task, max_skills=max_select)
+            selected = self._skill_registry.select_skills_without_llm(task, max_skills=ts_pool_size)
             selection_record = {
                 "method": "no_llm_prefilter",
                 "task": task[:500],
@@ -723,17 +729,21 @@ class OpenSpace:
                 "selected": [s.skill_id for s in selected],
             }
 
-        # W6-P1: Thompson Sampling blend — reorder by TS posterior + hybrid score
+        # W6-P1: Thompson Sampling blend — reorder pool by TS posterior + hybrid score,
+        # then truncate to max_select. top_k truncation happens inside ts_blend_reorder.
         if self._skill_store and selected:
             try:
                 bandit_stats = self._skill_store.get_bandit_stats(
                     [s.skill_id for s in selected]
                 )
                 selected = self._skill_registry.ts_blend_reorder(
-                    selected, bandit_stats, skill_quality=skill_quality
+                    selected, bandit_stats, skill_quality=skill_quality, top_k=max_select
                 )
             except Exception as _ts_exc:
                 logger.debug("TS blend failed — using hybrid order: %s", _ts_exc)
+                selected = selected[:max_select]  # fallback truncation
+        else:
+            selected = selected[:max_select]  # no TS — take top max_select directly
 
         # Record skill selection to metadata.json
         if self._recording_manager and selection_record:
@@ -817,15 +827,19 @@ class OpenSpace:
             if not analysis:
                 return
 
-            # Trigger 1: post-analysis evolution
-            if analysis.candidate_for_evolution and self._skill_evolver:
+            # Trigger 1: post-analysis evolution + bandit updates + failure distillation
+            # process_analysis() handles non-evolution case gracefully (returns [])
+            # so we call it unconditionally — gate only blocked bandit+distillation updates
+            if self._skill_evolver:
                 self._skill_evolver.set_available_tools(agent_tools)
 
-                evo_summary = ", ".join(
-                    f"{s.evolution_type.value}({'+'.join(s.target_skill_ids) or 'new'})"
-                    for s in analysis.evolution_suggestions
-                )
-                logger.info(f"[Skill Evolution] Suggestions: {evo_summary}")
+                if analysis.candidate_for_evolution:
+                    evo_summary = ", ".join(
+                        f"{s.evolution_type.value}({'+'.join(s.target_skill_ids) or 'new'})"
+                        for s in analysis.evolution_suggestions
+                    )
+                    logger.info(f"[Skill Evolution] Suggestions: {evo_summary}")
+
                 evolved_records = await self._skill_evolver.process_analysis(analysis)
 
                 # Track evolved skills for the caller

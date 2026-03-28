@@ -24,6 +24,7 @@ from typing import Any, Dict, Generator, List, Optional
 
 from .patch import collect_skill_snapshot, compute_unified_diff
 from .types import (
+    CausalAttribution,
     EvolutionSuggestion,
     ExecutionAnalysis,
     SkillCategory,
@@ -199,6 +200,27 @@ CREATE TABLE IF NOT EXISTS skill_dispatch_events (
 );
 CREATE INDEX IF NOT EXISTS idx_sde_task ON skill_dispatch_events(task_id);
 CREATE INDEX IF NOT EXISTS idx_sde_ts   ON skill_dispatch_events(dispatched_at);
+
+CREATE TABLE IF NOT EXISTS skill_causal_attributions (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    analysis_id     INTEGER NOT NULL REFERENCES execution_analyses(id) ON DELETE CASCADE,
+    skill_id        TEXT    NOT NULL,
+    outcome_role    TEXT    NOT NULL DEFAULT 'neutral',
+    summary         TEXT    NOT NULL DEFAULT '',
+    counterfactual  TEXT    NOT NULL DEFAULT '',
+    evidence_steps  TEXT    NOT NULL DEFAULT '[]',
+    tool_keys       TEXT    NOT NULL DEFAULT '[]',
+    failure_mode    TEXT    NOT NULL DEFAULT '',
+    abductive_score REAL    NOT NULL DEFAULT 0.0,
+    act_score       REAL    NOT NULL DEFAULT 0.0,
+    predict_score   REAL    NOT NULL DEFAULT 0.0,
+    causal_score    REAL    NOT NULL DEFAULT 0.0,
+    bandit_reward   REAL    NOT NULL DEFAULT 0.0,
+    confidence      REAL    NOT NULL DEFAULT 0.0,
+    UNIQUE(analysis_id, skill_id)
+);
+CREATE INDEX IF NOT EXISTS idx_sca_analysis ON skill_causal_attributions(analysis_id);
+CREATE INDEX IF NOT EXISTS idx_sca_skill    ON skill_causal_attributions(skill_id);
 """
 
 
@@ -1311,14 +1333,20 @@ class SkillStore:
                 result[sid] = SkillBanditStats(skill_id=sid)
         return result
 
-    async def update_bandit(self, skill_id: str, *, success: bool) -> None:
-        """Increment alpha (success) or beta (failure) for one skill."""
-        await asyncio.to_thread(self._update_bandit_sync, skill_id, success)
+    async def update_bandit(self, skill_id: str, *, reward: float) -> None:
+        """Update Beta posterior for one skill using a signed causal reward.
+
+        W6-P3: reward is a float in [-1, 1] (from CausalAttribution.bandit_reward).
+        alpha += max(reward, 0.0)  — positive signal reinforces success probability
+        beta  += max(-reward, 0.0) — negative signal reinforces failure probability
+        Boolean callers should convert: True → 1.0, False → -1.0.
+        """
+        await asyncio.to_thread(self._update_bandit_sync, skill_id, reward)
 
     @_db_retry()
-    def _update_bandit_sync(self, skill_id: str, success: bool) -> None:
-        alpha_delta = 1.0 if success else 0.0
-        beta_delta = 0.0 if success else 1.0
+    def _update_bandit_sync(self, skill_id: str, reward: float) -> None:
+        alpha_delta = max(reward, 0.0)
+        beta_delta = max(-reward, 0.0)
         now_iso = datetime.now().isoformat()
         with self._mu:
             # Ensure row exists (no-op if already present)
@@ -1551,6 +1579,35 @@ class SkillStore:
                 (analysis_id, j.skill_id, int(j.skill_applied), j.note),
             )
 
+        # W6-P3: persist causal attributions if present
+        for ca in a.causal_attributions:
+            self._conn.execute(
+                """
+                INSERT OR REPLACE INTO skill_causal_attributions
+                (analysis_id, skill_id, outcome_role, summary, counterfactual,
+                 evidence_steps, tool_keys, failure_mode,
+                 abductive_score, act_score, predict_score,
+                 causal_score, bandit_reward, confidence)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                """,
+                (
+                    analysis_id,
+                    ca.skill_id,
+                    ca.outcome_role,
+                    ca.summary,
+                    ca.counterfactual,
+                    json.dumps(ca.evidence_steps, ensure_ascii=False),
+                    json.dumps(ca.tool_keys, ensure_ascii=False),
+                    ca.failure_mode,
+                    ca.abductive_score,
+                    ca.act_score,
+                    ca.predict_score,
+                    ca.causal_score,
+                    ca.bandit_reward,
+                    ca.confidence,
+                ),
+            )
+
         return analysis_id
 
     # Deserialization
@@ -1659,6 +1716,16 @@ class SkillStore:
             except (json.JSONDecodeError, KeyError, ValueError):
                 pass
 
+        # W6-P3: load causal attributions (may be empty for pre-P3 analyses)
+        ca_rows = conn.execute(
+            "SELECT skill_id, outcome_role, summary, counterfactual, "
+            "evidence_steps, tool_keys, failure_mode, "
+            "abductive_score, act_score, predict_score, "
+            "causal_score, bandit_reward, confidence "
+            "FROM skill_causal_attributions WHERE analysis_id=?",
+            (analysis_id,),
+        ).fetchall()
+
         return ExecutionAnalysis(
             task_id=row["task_id"],
             timestamp=datetime.fromisoformat(row["timestamp"]),
@@ -1674,6 +1741,24 @@ class SkillStore:
                 for jr in judgment_rows
             ],
             evolution_suggestions=suggestions,
+            causal_attributions=[
+                CausalAttribution(
+                    skill_id=cr["skill_id"],
+                    outcome_role=cr["outcome_role"],
+                    summary=cr["summary"],
+                    counterfactual=cr["counterfactual"],
+                    evidence_steps=json.loads(cr["evidence_steps"]),
+                    tool_keys=json.loads(cr["tool_keys"]),
+                    failure_mode=cr["failure_mode"],
+                    abductive_score=cr["abductive_score"],
+                    act_score=cr["act_score"],
+                    predict_score=cr["predict_score"],
+                    causal_score=cr["causal_score"],
+                    bandit_reward=cr["bandit_reward"],
+                    confidence=cr["confidence"],
+                )
+                for cr in ca_rows
+            ],
             analyzed_by=row["analyzed_by"],
             analyzed_at=datetime.fromisoformat(row["analyzed_at"]),
         )

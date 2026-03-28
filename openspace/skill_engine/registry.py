@@ -599,6 +599,7 @@ class SkillRegistry:
         *,
         ts_weight: float = 0.25,
         skill_quality: Optional[Dict[str, Dict[str, Any]]] = None,
+        top_k: Optional[int] = None,
     ) -> List[SkillMeta]:
         """Reorder *candidates* by blending Thompson Sampling with hybrid rank.
 
@@ -642,7 +643,8 @@ class SkillRegistry:
             blended.append((score, skill))
 
         blended.sort(key=lambda x: x[0], reverse=True)
-        return [skill for _, skill in blended]
+        result = [skill for _, skill in blended]
+        return result[:top_k] if top_k is not None else result
 
     def load_skill_content(self, skill_id: str) -> Optional[str]:
         """Return the SKILL.md content (with frontmatter stripped) for *skill_id*."""

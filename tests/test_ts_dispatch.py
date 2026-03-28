@@ -90,23 +90,23 @@ class TestBanditStore:
 
     @pytest.mark.asyncio
     async def test_update_bandit_success_increments_alpha(self, store):
-        await store.update_bandit("skill-a", success=True)
+        await store.update_bandit("skill-a", reward=1.0)
         stats = store.get_bandit_stats(["skill-a"])
         assert stats["skill-a"].alpha == 2.0  # 1.0 initial + 1.0
         assert stats["skill-a"].beta == 1.0
 
     @pytest.mark.asyncio
     async def test_update_bandit_failure_increments_beta(self, store):
-        await store.update_bandit("skill-b", success=False)
+        await store.update_bandit("skill-b", reward=-1.0)
         stats = store.get_bandit_stats(["skill-b"])
         assert stats["skill-b"].alpha == 1.0
         assert stats["skill-b"].beta == 2.0
 
     @pytest.mark.asyncio
     async def test_update_bandit_multiple_outcomes(self, store):
-        await store.update_bandit("skill-c", success=True)
-        await store.update_bandit("skill-c", success=True)
-        await store.update_bandit("skill-c", success=False)
+        await store.update_bandit("skill-c", reward=1.0)
+        await store.update_bandit("skill-c", reward=1.0)
+        await store.update_bandit("skill-c", reward=-1.0)
         stats = store.get_bandit_stats(["skill-c"])
         assert stats["skill-c"].alpha == 3.0   # 1.0 + 2 successes
         assert stats["skill-c"].beta == 2.0    # 1.0 + 1 failure
@@ -116,7 +116,7 @@ class TestBanditStore:
     async def test_update_bandit_no_fk_constraint(self, store):
         # skill_bandit has no FK to skill_records — ephemeral skills are fine
         try:
-            await store.update_bandit("ghost-skill", success=True)
+            await store.update_bandit("ghost-skill", reward=1.0)
         except Exception as exc:
             pytest.fail(f"update_bandit raised unexpectedly: {exc}")
 
@@ -267,9 +267,10 @@ class TestBanditUpdateIntegration:
         analysis.task_id = "task-001"
         analysis.task_completed = True
         analysis.candidate_for_evolution = False
+        analysis.causal_attributions = []  # no P3 attributions → binary fallback
         analysis.skill_judgments = [
-            MagicMock(skill_id="skill-alpha"),
-            MagicMock(skill_id="skill-beta"),
+            MagicMock(skill_id="skill-alpha", skill_applied=True),
+            MagicMock(skill_id="skill-beta", skill_applied=True),
         ]
         return analysis
 
@@ -280,7 +281,8 @@ class TestBanditUpdateIntegration:
         analysis.task_id = "task-002"
         analysis.task_completed = False
         analysis.candidate_for_evolution = False
-        analysis.skill_judgments = [MagicMock(skill_id="skill-gamma")]
+        analysis.causal_attributions = []
+        analysis.skill_judgments = [MagicMock(skill_id="skill-gamma", skill_applied=True)]
         analysis.execution_note = "timeout"
         analysis.tool_issues = []
         return analysis
@@ -323,12 +325,13 @@ class TestBanditUpdateIntegration:
         assert calls == {"skill-alpha", "skill-beta"}
 
     @pytest.mark.asyncio
-    async def test_update_bandits_bg_passes_success_correctly(
+    async def test_update_bandits_bg_passes_reward_correctly(
         self, evolver, mock_store, analysis_completed
     ):
+        # analysis_completed.task_completed=True, no causal_attributions → binary fallback 1.0
         await evolver._update_bandits_bg(analysis_completed)
         for call in mock_store.update_bandit.call_args_list:
-            assert call.kwargs.get("success") is True
+            assert call.kwargs.get("reward") == 1.0
 
     @pytest.mark.asyncio
     async def test_update_bandits_bg_handles_store_error_gracefully(

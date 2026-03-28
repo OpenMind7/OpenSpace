@@ -268,6 +268,9 @@ class ExecutionAnalysis:
     # Evolution suggestions — 0-N per analysis, each fully specifies an action
     evolution_suggestions: List[EvolutionSuggestion] = field(default_factory=list)
 
+    # W6-P3: Causal attributions (computed by AAP in analyzer; empty if not run)
+    causal_attributions: List[CausalAttribution] = field(default_factory=list)
+
     # Analysis metadata
     analyzed_by: str = ""                  # Model name used for analysis
     analyzed_at: datetime = field(default_factory=datetime.now)
@@ -444,6 +447,64 @@ class SkillBanditStats:
                 datetime.fromisoformat(data["last_updated"])
                 if data.get("last_updated") else datetime.now()
             ),
+        )
+
+
+# W6-P3: Abduct-Act-Predict causal attribution per skill per execution
+@dataclass
+class CausalAttribution:
+    """Causal attribution for a single skill in a single execution.
+
+    Produced by the AAP (Abduct-Act-Predict) framework inside ExecutionAnalyzer.
+    Scores are in [0, 1]; bandit_reward is signed float in [-1, 1].
+    """
+    skill_id: str
+    outcome_role: str = "neutral"          # helped | hurt | neutral
+    summary: str = ""                      # one-sentence causal explanation
+    counterfactual: str = ""               # "what would have worked instead"
+    evidence_steps: List[str] = field(default_factory=list)  # tool call steps supporting claim
+    tool_keys: List[str] = field(default_factory=list)        # tool names involved
+    failure_mode: str = ""                 # from _FAILURE_MODES or ""
+    abductive_score: float = 0.0           # P(this skill caused outcome)
+    act_score: float = 0.0                 # P(counterfactual would have worked)
+    predict_score: float = 0.0            # P(this analysis is correct)
+    causal_score: float = 0.0             # abductive * act * predict (composite)
+    bandit_reward: float = 0.0            # signed reward for TS: ∈ [-1, 1]
+    confidence: float = 0.0               # overall attribution confidence
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "skill_id": self.skill_id,
+            "outcome_role": self.outcome_role,
+            "summary": self.summary,
+            "counterfactual": self.counterfactual,
+            "evidence_steps": self.evidence_steps,
+            "tool_keys": self.tool_keys,
+            "failure_mode": self.failure_mode,
+            "abductive_score": self.abductive_score,
+            "act_score": self.act_score,
+            "predict_score": self.predict_score,
+            "causal_score": self.causal_score,
+            "bandit_reward": self.bandit_reward,
+            "confidence": self.confidence,
+        }
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "CausalAttribution":
+        return cls(
+            skill_id=data["skill_id"],
+            outcome_role=data.get("outcome_role", "neutral"),
+            summary=data.get("summary", ""),
+            counterfactual=data.get("counterfactual", ""),
+            evidence_steps=data.get("evidence_steps", []),
+            tool_keys=data.get("tool_keys", []),
+            failure_mode=data.get("failure_mode", ""),
+            abductive_score=float(data.get("abductive_score", 0.0)),
+            act_score=float(data.get("act_score", 0.0)),
+            predict_score=float(data.get("predict_score", 0.0)),
+            causal_score=float(data.get("causal_score", 0.0)),
+            bandit_reward=float(data.get("bandit_reward", 0.0)),
+            confidence=float(data.get("confidence", 0.0)),
         )
 
 

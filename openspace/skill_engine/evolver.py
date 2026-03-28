@@ -325,11 +325,26 @@ class SkillEvolver:
             logger.debug("Failure distillation failed (non-fatal): %s", e)
 
     async def _update_bandits_bg(self, analysis: ExecutionAnalysis) -> None:
-        """W6-P1: Background task — update TS bandit alpha/beta for each skill judgment."""
-        success = analysis.task_completed
+        """W6-P1/P3: Background task — update TS bandit posteriors for each applied skill.
+
+        Uses signed causal reward from AAP (P3) when available.
+        Falls back to binary signal (1.0 / -1.0) for skills without causal attribution.
+        Only updates skills that were actually applied (skill_applied=True).
+        """
+        # Build causal reward lookup from P3 attributions (may be empty)
+        causal_rewards = {
+            ca.skill_id: ca.bandit_reward
+            for ca in analysis.causal_attributions
+        }
+        # Binary fallback: success=1.0, failure=-1.0
+        binary_reward = 1.0 if analysis.task_completed else -1.0
+
         for judgment in analysis.skill_judgments:
+            if not judgment.skill_applied:
+                continue  # skip: skill was injected but not actually used
+            reward = causal_rewards.get(judgment.skill_id, binary_reward)
             try:
-                await self._store.update_bandit(judgment.skill_id, success=success)
+                await self._store.update_bandit(judgment.skill_id, reward=reward)
             except Exception as exc:
                 logger.debug("Bandit update failed for %s: %s", judgment.skill_id, exc)
 
