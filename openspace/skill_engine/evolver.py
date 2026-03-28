@@ -54,6 +54,9 @@ from .skill_utils import (
     validate_skill_dir as _validate_skill_dir,
     check_skill_safety as _check_skill_safety,
     is_skill_safe as _is_skill_safe,
+    parse_capabilities as _parse_capabilities,
+    check_capability_violations as _check_capability_violations,
+    strip_frontmatter as _strip_frontmatter,
 )
 from .registry import write_skill_id
 from .store import SkillStore
@@ -1297,6 +1300,20 @@ class SkillEvolver:
                             logger.warning(
                                 f"Post-evolution safety flags (non-blocking): {safety_flags}"
                             )
+                        # Capability manifest check: warn if evolved skill
+                        # uses APIs not declared in its capabilities field
+                        declared_caps = _parse_capabilities(skill_content)
+                        if declared_caps:
+                            body = _strip_frontmatter(skill_content)
+                            cap_violations = _check_capability_violations(
+                                declared_caps, body,
+                            )
+                            if cap_violations:
+                                logger.warning(
+                                    "Post-evolution capability violations "
+                                    "(non-blocking): %s",
+                                    cap_violations,
+                                )
                         if attempt > 0:
                             logger.info(
                                 f"Apply-retry succeeded on attempt {attempt + 1}/{_MAX_EVOLUTION_ATTEMPTS}"

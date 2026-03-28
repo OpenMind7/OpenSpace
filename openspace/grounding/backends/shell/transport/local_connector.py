@@ -94,6 +94,45 @@ def _wrap_script_with_conda(script: str, conda_env: str | None) -> str:
             return script
 
 
+# ---------------------------------------------------------------------------
+# Resource limit preambles (Gate Patch 6)
+# ---------------------------------------------------------------------------
+# asyncio.create_subprocess_exec does not support preexec_fn, so we inject
+# resource-limit code into the temp scripts themselves.
+
+_BASH_RLIMIT_PREAMBLE = """\
+# --- OpenSpace resource limits ---
+ulimit -t 300 2>/dev/null    # CPU time (seconds)
+ulimit -v 2097152 2>/dev/null  # Virtual memory (KB) — 2 GB
+ulimit -f 512000 2>/dev/null   # Max file size (KB blocks) — 500 MB
+ulimit -n 1024 2>/dev/null     # Open file descriptors
+# --- end resource limits ---
+"""
+
+_PYTHON_RLIMIT_PREAMBLE = """\
+# --- OpenSpace resource limits ---
+import resource as _os_rlimit
+for _res, _lim in [
+    (_os_rlimit.RLIMIT_CPU, (300, 300)),
+    (_os_rlimit.RLIMIT_FSIZE, (500 * 1024 * 1024, 500 * 1024 * 1024)),
+    (_os_rlimit.RLIMIT_NOFILE, (1024, 1024)),
+]:
+    try:
+        _os_rlimit.setrlimit(_res, _lim)
+    except (ValueError, OSError):
+        pass
+# RLIMIT_AS is unsupported on macOS — only set on Linux
+import sys as _os_sys
+if _os_sys.platform == "linux":
+    try:
+        _os_rlimit.setrlimit(_os_rlimit.RLIMIT_AS, (2 * 1024**3, 2 * 1024**3))
+    except (ValueError, OSError):
+        pass
+del _os_rlimit, _os_sys, _res, _lim
+# --- end resource limits ---
+"""
+
+
 class LocalShellConnector(BaseConnector[Any]):
     """
     Shell connector that runs scripts **locally** using asyncio subprocesses,
@@ -277,6 +316,7 @@ class LocalShellConnector(BaseConnector[Any]):
 
         try:
             with open(temp_filename, "w") as f:
+                f.write(_PYTHON_RLIMIT_PREAMBLE)
                 f.write(code)
 
             logger.info(
@@ -353,6 +393,7 @@ class LocalShellConnector(BaseConnector[Any]):
 
         try:
             with open(temp_filename, "w") as f:
+                f.write(_BASH_RLIMIT_PREAMBLE)
                 f.write(final_script)
             os.chmod(temp_filename, 0o755)
 

@@ -103,7 +103,15 @@ logging.basicConfig(
 )
 logger = logging.getLogger("openspace.mcp_server")
 
+from pydantic import ValidationError
+
 from mcp.server.fastmcp import FastMCP
+from openspace.mcp_validation import (
+    ExecuteTaskInput,
+    FixSkillInput,
+    SearchSkillsInput,
+    UploadSkillInput,
+)
 
 _fastmcp_kwargs: dict = {}
 try:
@@ -522,6 +530,18 @@ async def execute_task(
                       if no API key is configured.
                       "local" — local SkillRegistry only (fast, no cloud).
     """
+    # Validate input at MCP boundary
+    try:
+        ExecuteTaskInput(
+            task=task,
+            workspace_dir=workspace_dir,
+            max_iterations=max_iterations,
+            skill_dirs=skill_dirs,
+            search_scope=search_scope,
+        )
+    except ValidationError as e:
+        return _json_error(f"Invalid input: {e}", status="validation_error")
+
     async with _task_semaphore:
         try:
             openspace = await _get_openspace()
@@ -603,6 +623,14 @@ async def search_skills(
         limit: Maximum results to return (default: 20).
         auto_import: Auto-download top public cloud skills (default: True).
     """
+    # Validate input at MCP boundary
+    try:
+        SearchSkillsInput(
+            query=query, source=source, limit=limit, auto_import=auto_import,
+        )
+    except ValidationError as e:
+        return _json_error(f"Invalid input: {e}", status="validation_error")
+
     try:
         from openspace.cloud.search import hybrid_search_skills
 
@@ -715,6 +743,12 @@ async def fix_skill(
                    e.g. "The API endpoint changed from v1 to v2" or
                    "Add retry logic for HTTP 429 rate limit errors".
     """
+    # Validate input at MCP boundary
+    try:
+        FixSkillInput(skill_dir=skill_dir, direction=direction)
+    except ValidationError as e:
+        return _json_error(f"Invalid input: {e}", status="validation_error")
+
     try:
         from openspace.skill_engine.types import EvolutionSuggestion, EvolutionType
         from openspace.skill_engine.evolver import EvolutionContext, EvolutionTrigger
@@ -842,6 +876,20 @@ async def upload_skill(
         created_by: Override creator.  Default: from .upload_meta.json.
         change_summary: Override summary.  Default: from .upload_meta.json.
     """
+    # Validate input at MCP boundary
+    try:
+        UploadSkillInput(
+            skill_dir=skill_dir,
+            visibility=visibility,
+            origin=origin,
+            parent_skill_ids=parent_skill_ids,
+            tags=tags,
+            created_by=created_by,
+            change_summary=change_summary,
+        )
+    except ValidationError as e:
+        return _json_error(f"Invalid input: {e}", status="validation_error")
+
     try:
         skill_path = Path(skill_dir)
         if not (skill_path / "SKILL.md").exists():

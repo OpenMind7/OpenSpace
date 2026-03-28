@@ -333,3 +333,73 @@ def truncate(text: str, max_chars: int) -> str:
         return text
     return text[:max_chars] + f"\n\n... [truncated at {max_chars} chars]"
 
+
+# ---------------------------------------------------------------------------
+# Skill Capability Manifest (Gate Patch 5)
+# ---------------------------------------------------------------------------
+
+VALID_CAPABILITIES = frozenset({
+    "network",        # HTTP / websocket / DNS access
+    "filesystem",     # Read / write local files beyond skill dir
+    "subprocess",     # Shell / process execution
+    "env_vars",       # Environment variable access
+    "cloud_api",      # External cloud API calls (OpenAI, etc.)
+    "gpu",            # GPU compute
+})
+
+_CAPABILITY_DETECTORS: List[tuple[str, re.Pattern]] = [
+    ("network", re.compile(
+        r"(?:requests\.|urllib|httpx|aiohttp|fetch\(|curl\s|wget\s)",
+        re.IGNORECASE,
+    )),
+    ("subprocess", re.compile(
+        r"(?:subprocess\.|os\.system|os\.popen|os\.exec[lv]?p?|Popen)",
+        re.IGNORECASE,
+    )),
+    ("env_vars", re.compile(
+        r"(?:os\.environ|os\.getenv|dotenv\.load|load_dotenv)",
+        re.IGNORECASE,
+    )),
+    ("filesystem", re.compile(
+        r"(?:open\s*\(|pathlib\.Path|shutil\.|os\.remove|os\.mkdir)",
+        re.IGNORECASE,
+    )),
+]
+
+
+def parse_capabilities(content: str) -> frozenset[str]:
+    """Parse ``capabilities`` field from SKILL.md frontmatter.
+
+    Expected format::
+
+        capabilities: network,filesystem,subprocess
+
+    Returns a frozenset of validated capability names.
+    Unknown capabilities are logged and ignored.
+    """
+    raw = get_frontmatter_field(content, "capabilities")
+    if not raw:
+        return frozenset()
+    caps = frozenset(c.strip().lower() for c in raw.split(",") if c.strip())
+    invalid = caps - VALID_CAPABILITIES
+    if invalid:
+        logger.warning("Unknown capabilities ignored: %s", invalid)
+    return caps & VALID_CAPABILITIES
+
+
+def check_capability_violations(
+    declared: frozenset[str],
+    body: str,
+) -> List[str]:
+    """Check if skill body uses capabilities not declared in its manifest.
+
+    Returns a list of violation descriptions (empty = clean).
+    """
+    violations: List[str] = []
+    for cap, pattern in _CAPABILITY_DETECTORS:
+        if cap not in declared and pattern.search(body):
+            violations.append(
+                f"Uses {cap} APIs but '{cap}' capability not declared in manifest"
+            )
+    return violations
+
