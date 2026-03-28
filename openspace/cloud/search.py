@@ -1,9 +1,10 @@
-"""Hybrid skill search engine (BM25 + embedding + lexical boost).
+"""Hybrid skill search engine (BM25 + embedding + lexical boost + nexus-kb).
 
 Implements the search pipeline:
+  Phase 0: nexus-kb FTS5 search (knowledge base cross-validation)
   Phase 1: BM25 rough-rank over all candidates
   Phase 2: Vector scoring (embedding cosine similarity)
-  Phase 3: Hybrid score = vector_score + lexical_boost
+  Phase 3: Hybrid score = vector_score + lexical_boost + nexus_boost
   Phase 4: Deduplication + limit
 
 Used by MCP ``search_skills`` tool, ``retrieve_skill`` agent tool,
@@ -18,6 +19,9 @@ import re
 from typing import Any, Dict, List, Optional
 
 logger = logging.getLogger("openspace.cloud")
+
+# Cross-validation boost when a skill matches nexus-kb keywords.
+_NEXUS_KB_CROSS_VALIDATION_BOOST = 0.2
 
 
 def _check_safety(text: str) -> list[str]:
@@ -86,6 +90,7 @@ class SkillSearchEngine:
         candidates: List[Dict[str, Any]],
         *,
         query_embedding: Optional[List[float]] = None,
+        nexus_kb_keywords: Optional[set] = None,
         limit: int = 20,
     ) -> List[Dict[str, Any]]:
         """Run the full search pipeline on candidates.
@@ -99,6 +104,7 @@ class SkillSearchEngine:
             query: Search query text.
             candidates: Candidate dicts to rank.
             query_embedding: Pre-computed query embedding (if available).
+            nexus_kb_keywords: Keywords from nexus-kb hits for cross-validation.
             limit: Max results to return.
 
         Returns:
@@ -115,8 +121,10 @@ class SkillSearchEngine:
         # Phase 1: BM25 rough-rank
         filtered = self._bm25_phase(q, candidates, limit)
 
-        # Phase 2+3: Vector + lexical scoring
-        scored = self._score_phase(filtered, query_tokens, query_embedding)
+        # Phase 2+3: Vector + lexical + nexus-kb cross-validation scoring
+        scored = self._score_phase(
+            filtered, query_tokens, query_embedding, nexus_kb_keywords
+        )
 
         # Phase 4: Deduplicate and limit
         return self._dedup_and_limit(scored, limit)
@@ -154,8 +162,9 @@ class SkillSearchEngine:
         candidates: List[Dict[str, Any]],
         query_tokens: list[str],
         query_embedding: Optional[List[float]],
+        nexus_kb_keywords: Optional[set] = None,
     ) -> List[Dict[str, Any]]:
-        """Compute hybrid score = vector_score + lexical_boost."""
+        """Compute hybrid score = vector_score + lexical_boost + nexus_boost."""
         from openspace.cloud.embedding import cosine_similarity
 
         scored = []
@@ -173,7 +182,17 @@ class SkillSearchEngine:
             # Lexical boost
             lexical = _lexical_boost(query_tokens, name, slug)
 
-            final_score = vector_score + lexical
+            # Nexus-kb cross-validation boost
+            nexus_boost = 0.0
+            if nexus_kb_keywords:
+                name_tokens = _tokenize(name)
+                desc_tokens = _tokenize(c.get("description", ""))
+                candidate_tokens = set(name_tokens + desc_tokens)
+                overlap = candidate_tokens & nexus_kb_keywords
+                if overlap:
+                    nexus_boost = _NEXUS_KB_CROSS_VALIDATION_BOOST
+
+            final_score = vector_score + lexical + nexus_boost
 
             entry: Dict[str, Any] = {
                 "skill_id": c.get("skill_id", ""),
@@ -184,6 +203,8 @@ class SkillSearchEngine:
             }
             if vector_score > 0:
                 entry["vector_score"] = round(vector_score, 4)
+            if nexus_boost > 0:
+                entry["nexus_kb_validated"] = True
             # Include optional fields
             for key in ("path", "visibility", "created_by", "origin", "tags", "quality", "safety_flags"):
                 if c.get(key):
@@ -198,16 +219,22 @@ class SkillSearchEngine:
         scored: List[Dict[str, Any]],
         limit: int,
     ) -> List[Dict[str, Any]]:
-        """Deduplicate by name and apply limit."""
-        seen: set[str] = set()
-        deduped = []
+        """Deduplicate by (source, skill_id) with local-preferred tiebreak."""
+        seen: dict[str, Dict[str, Any]] = {}
         for item in scored:
-            name = item["name"]
-            if name in seen:
+            source = item.get("source", "unknown")
+            skill_id = item.get("skill_id", item.get("id", ""))
+            key = f"{source}:{skill_id}" if skill_id else item["name"]
+            if key in seen:
+                # Prefer local over cloud, then higher score
+                existing = seen[key]
+                if source == "local" and existing.get("source") != "local":
+                    seen[key] = item
+                elif item.get("score", 0) > existing.get("score", 0):
+                    seen[key] = item
                 continue
-            seen.add(name)
-            deduped.append(item)
-        return deduped[:limit]
+            seen[key] = item
+        return list(seen.values())[:limit]
 
 
 def build_local_candidates(
@@ -329,6 +356,9 @@ async def hybrid_search_skills(
     Cloud is attempted when *source* includes it; failures are silently
     skipped so the caller always gets local results at minimum.
 
+    Phase 0 (nexus-kb) runs before BM25 to provide cross-validation
+    keywords — skills matching nexus-kb knowledge get a score boost.
+
     Args:
         query: Free-text search query.
         local_skills: ``SkillMeta`` list (from ``registry.list_skills()``).
@@ -344,6 +374,24 @@ async def hybrid_search_skills(
     q = query.strip()
     if not q:
         return []
+
+    # Phase 0: nexus-kb knowledge search for cross-validation keywords.
+    nexus_kb_keywords: Optional[set] = None
+    nexus_kb_hits: List[Dict[str, Any]] = []
+    try:
+        from openspace.nexus_kb_bridge import search as nexus_search
+        from openspace.nexus_kb_bridge import extract_keywords
+
+        nexus_kb_hits = await asyncio.to_thread(nexus_search, q, limit=8)
+        if nexus_kb_hits:
+            nexus_kb_keywords = extract_keywords(nexus_kb_hits)
+            logger.info(
+                "nexus-kb Layer 0: %d hits, %d keywords extracted",
+                len(nexus_kb_hits),
+                len(nexus_kb_keywords) if nexus_kb_keywords else 0,
+            )
+    except Exception as e:
+        logger.debug("nexus-kb Layer 0 unavailable (non-fatal): %s", e)
 
     candidates: List[Dict[str, Any]] = []
 
@@ -389,5 +437,10 @@ async def hybrid_search_skills(
         pass
 
     engine = SkillSearchEngine()
-    return engine.search(q, candidates, query_embedding=query_embedding, limit=limit)
+    return engine.search(
+        q, candidates,
+        query_embedding=query_embedding,
+        nexus_kb_keywords=nexus_kb_keywords,
+        limit=limit,
+    )
 

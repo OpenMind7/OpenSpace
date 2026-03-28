@@ -13,6 +13,7 @@ Integration:
 
 from __future__ import annotations
 
+import asyncio
 import copy
 import json
 import re
@@ -84,13 +85,15 @@ def _correct_skill_ids(
             if prefix and k.split("__")[0] == prefix
         ]
 
-        best, best_dist = None, 4  # threshold: edit distance ≤ 3
+        best, best_dist, is_unique = None, 4, True  # threshold: edit distance ≤ 3
         for cand in candidates:
             d = _edit_distance(raw_id, cand)
             if d < best_dist:
-                best, best_dist = cand, d
+                best, best_dist, is_unique = cand, d, True
+            elif d == best_dist and cand != best:
+                is_unique = False  # ambiguous: multiple candidates at same distance
 
-        if best is not None:
+        if best is not None and is_unique:
             logger.info(
                 f"Corrected LLM skill ID: {raw_id!r} → {best!r} "
                 f"(edit_distance={best_dist})"
@@ -227,6 +230,10 @@ class ExecutionAnalyzer:
             )
             await self._record_tool_quality_feedback(analysis, traj_tool_status)
 
+            # 7. Feed skill judgments to nexus-kb (cross-system feedback loop).
+            #    Run via to_thread to avoid blocking the event loop with sync SQLite I/O.
+            await asyncio.to_thread(self._record_nexus_kb_feedback, analysis)
+
             return analysis
 
         except Exception as e:
@@ -321,6 +328,46 @@ class ExecutionAnalyzer:
         except Exception as e:
             # Quality feedback is best-effort; never break analysis flow
             logger.debug(f"Tool quality feedback failed: {e}")
+
+    @staticmethod
+    def _record_nexus_kb_feedback(analysis: ExecutionAnalysis) -> None:
+        """Feed skill judgments to nexus-kb for cross-system learning.
+
+        Maps skill_applied (True/False) to useful/not-useful feedback
+        on any nexus-kb entries matching the skill name or task keywords.
+        Best-effort — never blocks the analysis pipeline.
+        """
+        try:
+            from openspace.nexus_kb_bridge import search, record_feedback
+
+            # Search nexus-kb for entries related to this task.
+            task_desc = analysis.execution_note or analysis.task_id or ""
+            if not task_desc or len(task_desc) < 5:
+                return
+
+            hits = search(task_desc, limit=5, min_confidence=0.2)
+            if not hits:
+                return
+
+            # Use task completion as a signal for top hit usefulness.
+            useful = analysis.task_completed
+            confirmed = 0
+            for hit in hits[:3]:
+                if record_feedback(hit["entry_id"], useful):
+                    confirmed += 1
+
+            if confirmed > 0:
+                logger.debug(
+                    "nexus-kb feedback: %d/%d confirmed, useful=%s (task=%s)",
+                    confirmed, min(3, len(hits)), useful, analysis.task_id,
+                )
+            else:
+                logger.warning(
+                    "nexus-kb feedback: 0/%d writes succeeded (task=%s)",
+                    min(3, len(hits)), analysis.task_id,
+                )
+        except Exception as e:
+            logger.debug("nexus-kb feedback failed (non-fatal): %s", e)
 
     def _load_recording_context(
         self,
@@ -725,7 +772,17 @@ class ExecutionAnalyzer:
         from openspace.recording import RecordingManager
 
         model = self._model or self._llm_client.model
-        analysis_tools: List[BaseTool] = list(available_tools or [])
+        # Security: restrict to read-only tools — never reuse shell/write/exec
+        # tools from the original execution (prompt injection vector)
+        _BLOCKED_TOOL_NAMES = frozenset({
+            "run_shell", "shell_agent", "_python_exec", "_bash_exec",
+            "write_file", "create_file", "execute_code_sandbox",
+            "create_video", "gui_agent",
+        })
+        analysis_tools: List[BaseTool] = [
+            t for t in (available_tools or [])
+            if getattr(t, "_name", getattr(t, "name", "")) not in _BLOCKED_TOOL_NAMES
+        ]
 
         messages: List[Dict[str, Any]] = [
             {"role": "user", "content": prompt},

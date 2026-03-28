@@ -557,7 +557,7 @@ async def execute_task(
 
     except Exception as e:
         logger.error(f"execute_task failed: {e}", exc_info=True)
-        return _json_error(e, status="error", traceback=traceback.format_exc(limit=5))
+        return _json_error(e, status="error")
 
 
 @mcp.tool()
@@ -619,6 +619,15 @@ async def search_skills(
             limit=limit,
         )
 
+        # nexus-kb knowledge context (supplementary — helps callers
+        # understand why certain skills were boosted).
+        knowledge_hits: List[Dict[str, Any]] = []
+        try:
+            from openspace.nexus_kb_bridge import search as nexus_search
+            knowledge_hits = await asyncio.to_thread(nexus_search, q, limit=5)
+        except Exception:
+            pass
+
         _AUTO_IMPORT_MAX = 3
         import_summary: List[Dict[str, Any]] = []
         if auto_import:
@@ -652,6 +661,8 @@ async def search_skills(
         output: Dict[str, Any] = {"results": results, "count": len(results)}
         if import_summary:
             output["auto_import_summary"] = import_summary
+        if knowledge_hits:
+            output["knowledge_context"] = knowledge_hits
         return _json_ok(output)
 
     except Exception as e:
@@ -774,7 +785,7 @@ async def fix_skill(
 
     except Exception as e:
         logger.error(f"fix_skill failed: {e}", exc_info=True)
-        return _json_error(e, status="error", traceback=traceback.format_exc(limit=5))
+        return _json_error(e, status="error")
 
 
 @mcp.tool()
@@ -845,7 +856,7 @@ async def upload_skill(
 
     except Exception as e:
         logger.error(f"upload_skill failed: {e}", exc_info=True)
-        return _json_error(e, status="error", traceback=traceback.format_exc(limit=5))
+        return _json_error(e, status="error")
 
 def run_mcp_server() -> None:
     """Console-script entry point for ``openspace-mcp``."""

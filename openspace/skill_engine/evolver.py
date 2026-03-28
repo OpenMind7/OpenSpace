@@ -1003,6 +1003,31 @@ class SkillEvolver:
         self._registry.add_skill(new_meta)
 
         logger.info(f"CAPTURED: {new_name} [{new_id}]")
+
+        # Auto-distill captured pattern to nexus-kb as draft entry.
+        # Run via to_thread to avoid blocking the event loop with sync SQLite I/O.
+        try:
+            from openspace.nexus_kb_bridge import distill_pattern
+            entry_id = await asyncio.to_thread(
+                distill_pattern,
+                title=f"OPENSPACE-CAP {new_name}",
+                content=(
+                    f"Captured skill pattern: {new_name}\n\n"
+                    f"Description: {new_desc or new_name}\n\n"
+                    f"Direction: {ctx.suggestion.direction}\n\n"
+                    f"Change summary: {change_summary or 'N/A'}"
+                ),
+                domain="automation",
+                tags=[new_name, "captured-skill"],
+                task_context=ctx.suggestion.direction,
+            )
+            if entry_id is None:
+                logger.warning("nexus-kb distill returned None for %s", new_name)
+            else:
+                logger.debug("nexus-kb distill OK: entry_id=%s for %s", entry_id, new_name)
+        except Exception as e:
+            logger.debug("nexus-kb distill failed (non-fatal): %s", e)
+
         return new_record
 
     async def _run_evolution_loop(
@@ -1036,9 +1061,20 @@ class SkillEvolver:
         model = self._model or self._llm_client.model
 
         # Merge tools from context and instance-level
-        evolution_tools: List["BaseTool"] = list(ctx.available_tools or [])
-        if not evolution_tools:
-            evolution_tools = list(self._available_tools)
+        _raw_tools: List["BaseTool"] = list(ctx.available_tools or [])
+        if not _raw_tools:
+            _raw_tools = list(self._available_tools)
+        # Security: restrict to read-only tools — never reuse shell/write/exec
+        # tools during evolution (prompt injection vector via recorded content)
+        _BLOCKED_TOOL_NAMES = frozenset({
+            "run_shell", "shell_agent", "_python_exec", "_bash_exec",
+            "write_file", "create_file", "execute_code_sandbox",
+            "create_video", "gui_agent",
+        })
+        evolution_tools: List["BaseTool"] = [
+            t for t in _raw_tools
+            if getattr(t, "_name", getattr(t, "name", "")) not in _BLOCKED_TOOL_NAMES
+        ]
 
         messages: List[Dict[str, Any]] = [
             {"role": "user", "content": prompt},

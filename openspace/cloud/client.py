@@ -338,9 +338,18 @@ class OpenSpaceClient:
         # 1. Fetch metadata
         logger.info(f"import_skill: fetching metadata for {skill_id}")
         record_data = self.fetch_record(skill_id)
-        skill_name = record_data.get("name", skill_id)
+        raw_name = record_data.get("name", skill_id)
+        # Sanitize: strip path separators and traversal components
+        skill_name = Path(raw_name).name.replace("..", "").strip(". ")
+        if not skill_name:
+            skill_name = skill_id.replace("/", "_").replace("..", "")
 
         skill_dir = target_dir / skill_name
+        # Verify resolved path stays within target_dir
+        if not skill_dir.resolve().is_relative_to(target_dir.resolve()):
+            raise CloudError(
+                f"Skill name {raw_name!r} resolves outside target directory"
+            )
 
         # Check if already exists locally
         if skill_dir.exists() and (skill_dir / SKILL_FILENAME).exists():
@@ -409,7 +418,14 @@ class OpenSpaceClient:
                     clean_name = Path(info.filename).as_posix()
                     if clean_name.startswith("..") or clean_name.startswith("/"):
                         continue
-                    target_path = target_dir / clean_name
+                    target_path = (target_dir / clean_name).resolve()
+                    # Reject any entry that escapes target_dir after resolution
+                    if not target_path.is_relative_to(target_dir.resolve()):
+                        logger.warning(
+                            "Skipping zip entry %r: resolves outside target dir",
+                            info.filename,
+                        )
+                        continue
                     target_path.parent.mkdir(parents=True, exist_ok=True)
                     target_path.write_bytes(zf.read(info))
                     extracted.append(clean_name)
