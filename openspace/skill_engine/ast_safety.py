@@ -39,6 +39,8 @@ _DANGEROUS_EXEC_MODULES: frozenset[str] = frozenset({
     "signal",                             # intercept termination signals
     "zipimport",                          # load code from zip archives
     "gc",                                 # gc.get_objects() enumerates live objects in memory
+    # W20.1: operator reflection — attrgetter/methodcaller bypass attribute checks
+    "operator",
 })
 
 _DANGEROUS_EXFIL_MODULES: frozenset[str] = frozenset({
@@ -255,10 +257,15 @@ class DangerousNodeVisitor(ast.NodeVisitor):
 
         W17 H2: Propagate taint from ALL elements of literal iterables,
         not just single-element ones.
+        W20.1: Also propagate taint from non-literal iterables when the
+        iterable resolves to a dangerous value (e.g., ``for v in d.values()``
+        where d contains os.system).
         """
         if isinstance(node.iter, (ast.List, ast.Tuple, ast.Set)):
             for elt in node.iter.elts:
                 self._propagate_taint_target(node.target, elt)
+        else:
+            self._propagate_for_iterable_taint(node.target, node.iter)
         self.generic_visit(node)
 
     def visit_AsyncFor(self, node: ast.AsyncFor) -> None:
@@ -266,7 +273,33 @@ class DangerousNodeVisitor(ast.NodeVisitor):
         if isinstance(node.iter, (ast.List, ast.Tuple, ast.Set)):
             for elt in node.iter.elts:
                 self._propagate_taint_target(node.target, elt)
+        else:
+            self._propagate_for_iterable_taint(node.target, node.iter)
         self.generic_visit(node)
+
+    def _propagate_for_iterable_taint(
+        self, target: ast.expr, iterable: ast.expr
+    ) -> None:
+        """W20.1: Propagate taint from non-literal for-loop iterables.
+
+        Handles: ``for v in d.values()`` / ``for v in d`` where d is tainted,
+        and ``for k, v in d.items()`` with tuple unpacking.
+        """
+        # Direct name iteration: for v in d (where d is tainted)
+        resolved = self._peel_to_resolve(iterable)
+        if resolved is not None and self._is_dangerous_resolved(resolved):
+            self._propagate_taint_target(target, iterable)
+            return
+        # Method call on tainted name: for v in d.values() / d.items()
+        if (
+            isinstance(iterable, ast.Call)
+            and isinstance(iterable.func, ast.Attribute)
+            and iterable.func.attr in ("values", "items", "keys")
+        ):
+            receiver = iterable.func.value
+            recv_resolved = self._peel_to_resolve(receiver)
+            if recv_resolved is not None and self._is_dangerous_resolved(recv_resolved):
+                self._propagate_taint_target(target, receiver)
 
     def visit_With(self, node: ast.With) -> None:
         """Track with-statement taint: ``with open(...) as f: ...``"""
@@ -347,14 +380,27 @@ class DangerousNodeVisitor(ast.NodeVisitor):
                 # Try resolving the iterable (e.g., a Name aliased to a list)
                 self._propagate_taint_target(gen.target, gen.iter)
 
+    def _flag_comprehension_element(self, elt: ast.expr) -> None:
+        """W20.1: Flag if a comprehension element resolves to a dangerous value.
+
+        Constructive taint: creating a collection containing dangerous objects
+        (e.g., ``{x for x in [os.environ]}``) is itself suspicious in a sandbox.
+        """
+        resolved = self._peel_to_resolve(elt)
+        if resolved is not None and self._is_dangerous_resolved(resolved):
+            self.flags.append(self._flag_for_resolved(resolved))
+
     def visit_ListComp(self, node: ast.ListComp) -> None:
         """W20 C2: Track list comprehension iteration taint."""
         self._visit_comprehension(node)
         self.generic_visit(node)
 
     def visit_SetComp(self, node: ast.SetComp) -> None:
-        """W20 C2: Track set comprehension iteration taint."""
+        """W20 C2: Track set comprehension iteration taint.
+        W20.1: Constructive taint — flag if the set element resolves to dangerous.
+        """
         self._visit_comprehension(node)
+        self._flag_comprehension_element(node.elt)
         self.generic_visit(node)
 
     def visit_GeneratorExp(self, node: ast.GeneratorExp) -> None:
@@ -363,8 +409,11 @@ class DangerousNodeVisitor(ast.NodeVisitor):
         self.generic_visit(node)
 
     def visit_DictComp(self, node: ast.DictComp) -> None:
-        """W20 C2: Track dict comprehension iteration taint."""
+        """W20 C2: Track dict comprehension iteration taint.
+        W20.1: Constructive taint — flag if dict value resolves to dangerous.
+        """
         self._visit_comprehension(node)
+        self._flag_comprehension_element(node.value)
         self.generic_visit(node)
 
     def _propagate_default_args(
@@ -402,8 +451,6 @@ class DangerousNodeVisitor(ast.NodeVisitor):
             self._propagate_taint(target.id, value)
         elif isinstance(target, (ast.Tuple, ast.List)):
             # For destructuring, propagate to each element.
-            # W17 H1: Check for Starred elements — starred makes exact-length
-            # matching unreliable, so propagate all value elements to all targets.
             has_starred = any(isinstance(e, ast.Starred) for e in target.elts)
             if (
                 not has_starred
@@ -412,10 +459,29 @@ class DangerousNodeVisitor(ast.NodeVisitor):
             ):
                 for t, v in zip(target.elts, value.elts):
                     self._propagate_taint_target(t, v)
+            elif has_starred and isinstance(value, (ast.Tuple, ast.List)):
+                # W20.1 FP2: Starred with known-length value — map fixed
+                # positions precisely, only starred target gets remainder.
+                starred_idx = next(
+                    i for i, e in enumerate(target.elts)
+                    if isinstance(e, ast.Starred)
+                )
+                n_before = starred_idx
+                n_after = len(target.elts) - starred_idx - 1
+                val_elts = value.elts
+                # Fixed positions before starred
+                for t, v in zip(target.elts[:n_before], val_elts[:n_before]):
+                    self._propagate_taint_target(t, v)
+                # Fixed positions after starred
+                if n_after > 0:
+                    for t, v in zip(target.elts[-n_after:], val_elts[-n_after:]):
+                        self._propagate_taint_target(t, v)
+                # Starred target gets remaining middle elements
+                starred_target = target.elts[starred_idx]
+                for v in val_elts[n_before:len(val_elts) - n_after if n_after else len(val_elts)]:
+                    self._propagate_taint_target(starred_target, v)
             elif isinstance(value, (ast.Tuple, ast.List)):
-                # W17 H1: Try each value element per target; stop at first
-                # that resolves to avoid stale-taint clearing from
-                # non-resolving elements wiping valid taint.
+                # No starred, length mismatch — try each value element per target
                 for elt in target.elts:
                     for v in value.elts:
                         r = self._resolve_rhs(v)
@@ -861,6 +927,27 @@ class DangerousNodeVisitor(ast.NodeVisitor):
                 else:
                     return None
             return "".join(parts)
+        # W20.1: chr(N) → single character (string construction bypass)
+        if (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == "chr"
+            and len(node.args) == 1
+            and isinstance(node.args[0], ast.Constant)
+            and isinstance(node.args[0].value, int)
+        ):
+            try:
+                return chr(node.args[0].value)
+            except (ValueError, OverflowError):
+                return None
+        # W20.1: string * int or int * string (repetition bypass)
+        if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Mult):
+            left = self._resolve_string_expr(node.left)
+            right = self._resolve_string_expr(node.right)
+            if left is not None and isinstance(node.right, ast.Constant) and isinstance(node.right.value, int):
+                return left * node.right.value
+            if right is not None and isinstance(node.left, ast.Constant) and isinstance(node.left.value, int):
+                return right * node.left.value
         return None
 
     # --- Call analysis ---
@@ -970,6 +1057,29 @@ class DangerousNodeVisitor(ast.NodeVisitor):
             resolved_full = self._name_aliases[chain]
             if self._is_dangerous_resolved(resolved_full):
                 self.flags.append(self._flag_for_resolved(resolved_full))
+                return
+
+        # W20.1: Multi-level prefix resolution for class attr chaining.
+        # e.g., chain = "C.env.get", "C.env" → "os.environ" in _name_aliases,
+        # so resolve to "os.environ.get" and re-check.
+        dot_parts = chain.split(".")
+        for i in range(len(dot_parts) - 1, 0, -1):
+            prefix = ".".join(dot_parts[:i])
+            if prefix in self._name_aliases:
+                resolved_prefix = self._name_aliases[prefix]
+                suffix = ".".join(dot_parts[i:])
+                resolved_chain = f"{resolved_prefix}.{suffix}"
+                if self._is_dangerous_resolved(resolved_chain):
+                    self.flags.append(self._flag_for_resolved(resolved_chain))
+                    return
+                # Also try _check_qualified_call on the resolved chain
+                self._check_qualified_call(resolved_chain)
+                return
+            if prefix in self._module_aliases:
+                resolved_prefix = self._module_aliases[prefix]
+                suffix = ".".join(dot_parts[i:])
+                resolved_chain = f"{resolved_prefix}.{suffix}"
+                self._check_qualified_call(resolved_chain)
                 return
 
         self._check_qualified_call(chain)
