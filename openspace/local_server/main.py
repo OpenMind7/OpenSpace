@@ -120,6 +120,8 @@ def wrap_script_with_conda(script: str, conda_env: str = None) -> str:
     Wrap script with conda activation command.
     If conda is not available, returns original script without conda activation.
     """
+    # W15.2: Validate conda_env before interpolating into bash script (Codex CRIT)
+    conda_env = validate_conda_env(conda_env)
     if not conda_env:
         return script
     

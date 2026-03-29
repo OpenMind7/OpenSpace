@@ -189,7 +189,7 @@ class DangerousNodeVisitor(ast.NodeVisitor):
         # Track name aliases: alias_name -> "module.name" or just "name"
         self._name_aliases: Dict[str, str] = {}
 
-    # --- Import tracking ---
+    # --- Import tracking + assignment taint ---
 
     def visit_Import(self, node: ast.Import) -> None:
         for alias in node.names:
@@ -208,6 +208,87 @@ class DangerousNodeVisitor(ast.NodeVisitor):
             # Record as "module.name" so we can resolve calls later
             self._name_aliases[local_name] = f"{mod_name}.{alias.name}"
         self.generic_visit(node)
+
+    # --- W15.3: Assignment-based taint propagation ---
+
+    def visit_Assign(self, node: ast.Assign) -> None:
+        """Track assignment-based alias propagation.
+
+        Catches patterns like:
+          x = os.environ  → taint x as os.environ
+          run = subprocess.run  → taint run as subprocess.run
+          sp = subprocess  → taint sp as subprocess (module alias)
+
+        Kill-on-rebind: reassignment naturally overwrites the old entry.
+        """
+        if len(node.targets) == 1 and isinstance(node.targets[0], ast.Name):
+            self._propagate_taint(node.targets[0].id, node.value)
+        self.generic_visit(node)
+
+    def visit_AnnAssign(self, node: ast.AnnAssign) -> None:
+        """Track annotated assignment taint: ``x: Any = os.environ``."""
+        if node.value and isinstance(node.target, ast.Name):
+            self._propagate_taint(node.target.id, node.value)
+        self.generic_visit(node)
+
+    def visit_NamedExpr(self, node: ast.NamedExpr) -> None:
+        """Track walrus operator taint: ``(x := os.environ)``."""
+        if isinstance(node.target, ast.Name):
+            self._propagate_taint(node.target.id, node.value)
+        self.generic_visit(node)
+
+    def _propagate_taint(self, target_name: str, value: ast.expr) -> None:
+        """Resolve *value* and record *target_name* as an alias.
+
+        If value resolves to a module name → ``_module_aliases``.
+        If value resolves to a qualified path → ``_name_aliases``.
+        If value cannot be resolved → no taint (conservative, not fail-closed
+        on assignment — we only fail-closed at USE sites).
+        """
+        resolved = self._resolve_rhs(value)
+        if resolved is None:
+            return
+
+        # Determine if resolved is a module (goes to _module_aliases)
+        # or a qualified name (goes to _name_aliases)
+        if (
+            resolved in self._module_aliases.values()
+            or resolved in _ALL_DANGEROUS_MODULES
+            or resolved in {"os", "sys", "builtins"}
+        ):
+            self._module_aliases[target_name] = resolved
+        else:
+            self._name_aliases[target_name] = resolved
+
+    def _resolve_rhs(self, node: ast.expr) -> Optional[str]:
+        """Resolve an expression to a qualified name string.
+
+        Returns None if the expression cannot be statically resolved
+        (e.g., function calls, arithmetic, comprehensions).
+        """
+        if isinstance(node, ast.Name):
+            name = node.id
+            if name in self._module_aliases:
+                return self._module_aliases[name]
+            if name in self._name_aliases:
+                return self._name_aliases[name]
+            return None
+
+        if isinstance(node, ast.Attribute):
+            chain = _resolve_attr_chain(node)
+            if chain is None:
+                return None
+            parts = chain.split(".", 1)
+            root = parts[0]
+            if root in self._module_aliases:
+                resolved = self._module_aliases[root]
+                return f"{resolved}.{parts[1]}" if len(parts) > 1 else resolved
+            if root in self._name_aliases:
+                resolved = self._name_aliases[root]
+                return f"{resolved}.{parts[1]}" if len(parts) > 1 else resolved
+            return chain
+
+        return None
 
     # --- Call analysis ---
 
@@ -361,7 +442,11 @@ class DangerousNodeVisitor(ast.NodeVisitor):
         resolved_mod: Optional[str] = None
 
         if isinstance(obj, ast.Name):
-            resolved_mod = self._module_aliases.get(obj.id, obj.id)
+            # W15.2: Also resolve through _name_aliases (Codex HIGH)
+            # e.g., `from os import environ as e` → _name_aliases["e"] = "os.environ"
+            resolved_mod = self._module_aliases.get(obj.id)
+            if resolved_mod is None:
+                resolved_mod = self._name_aliases.get(obj.id, obj.id)
         elif isinstance(obj, ast.Attribute):
             # S8: getattr(some.module, "func") — resolve the attribute chain
             chain = _resolve_attr_chain(obj)

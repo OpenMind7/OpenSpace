@@ -98,9 +98,34 @@ def check_skill_directory_safety(skill_dir: Path) -> List[str]:
     binary files and unknown extensions are skipped silently.
     """
     all_flags: List[str] = []
+    _MAX_DEPTH = 5  # Prevent symlink loop abuse in deeply nested dirs
+    if not skill_dir.is_dir():
+        return ["blocked.unreadable_directory"]
     try:
-        for fpath in sorted(skill_dir.iterdir()):
+        for fpath in sorted(skill_dir.rglob("*")):
+            if not fpath.is_file():
+                continue
+            # Depth guard: reject files nested beyond _MAX_DEPTH levels
+            try:
+                rel = fpath.relative_to(skill_dir)
+            except ValueError:
+                continue  # Outside skill_dir (e.g. symlink escape)
+            if len(rel.parts) > _MAX_DEPTH:
+                all_flags.append("blocked.excessive_nesting")
+                continue
             if fpath.suffix.lower() not in _SCANNABLE_EXTENSIONS:
+                # W15: Also detect shebang scripts without known extensions
+                try:
+                    with open(fpath, "rb") as bf:
+                        head = bf.read(64)
+                    if head.startswith(b"#!") and any(
+                        interp in head
+                        for interp in (b"python", b"bash", b"sh", b"node", b"ruby", b"perl")
+                    ):
+                        text = fpath.read_text(encoding="utf-8", errors="replace")
+                        all_flags.extend(check_skill_safety(text))
+                except OSError:
+                    pass
                 continue
             try:
                 text = fpath.read_text(encoding="utf-8", errors="replace")

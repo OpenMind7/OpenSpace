@@ -76,7 +76,8 @@ _INJECTION_ENV_VARS: FrozenSet[str] = frozenset({
 })
 
 # W14: Conda environment name validation (Codex CRIT — shell injection via conda_env)
-_CONDA_ENV_RE = re.compile(r'^[a-zA-Z0-9][a-zA-Z0-9._-]*$')
+# W15.2: Use fullmatch — re.match() with $ accepts trailing newline (Codex LOW)
+_CONDA_ENV_RE = re.compile(r'[a-zA-Z0-9][a-zA-Z0-9._-]*')
 
 
 def validate_conda_env(conda_env: Optional[str]) -> Optional[str]:
@@ -89,7 +90,7 @@ def validate_conda_env(conda_env: Optional[str]) -> Optional[str]:
         return None
     if len(conda_env) > 128:
         raise ValueError(f"Conda environment name too long: {len(conda_env)} chars")
-    if not _CONDA_ENV_RE.match(conda_env):
+    if not _CONDA_ENV_RE.fullmatch(conda_env):
         raise ValueError(
             f"Invalid conda environment name: {conda_env!r} — "
             "must match [a-zA-Z0-9._-]+"

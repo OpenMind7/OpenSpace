@@ -356,3 +356,24 @@ class TestCondaEnvValidation:
         """Leading dash could be interpreted as option flag."""
         with pytest.raises(ValueError):
             validate_conda_env("-malicious")
+
+    def test_rejects_trailing_newline_only(self):
+        """W15.2 LOW: 'myenv\\n' must be rejected.
+
+        Before W15.2, _CONDA_ENV_RE.match() with $ anchor accepted trailing
+        newline (Python re quirk: $ matches before final \\n).  Fix: use
+        fullmatch() which requires the ENTIRE string to match, no trailing
+        newline allowed.
+        """
+        with pytest.raises(ValueError):
+            validate_conda_env("myenv\n")
+
+    def test_rejects_carriage_return_injection(self):
+        """W15.2: Carriage return in conda env name must be rejected."""
+        with pytest.raises(ValueError):
+            validate_conda_env("myenv\r")
+
+    def test_rejects_null_byte_injection(self):
+        """W15.2: Null byte in conda env name must be rejected."""
+        with pytest.raises(ValueError):
+            validate_conda_env("myenv\x00")

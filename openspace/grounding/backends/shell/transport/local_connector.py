@@ -68,6 +68,8 @@ def _get_conda_activation_prefix(conda_env: str | None) -> str:
 
 def _wrap_script_with_conda(script: str, conda_env: str | None) -> str:
     """Wrap bash script with conda activation if needed."""
+    # W15.2: Validate conda_env before interpolating into bash script (Codex CRIT)
+    conda_env = validate_conda_env(conda_env)
     if not conda_env:
         return script
     if platform_name == "Windows":
