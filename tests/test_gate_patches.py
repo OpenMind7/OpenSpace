@@ -315,3 +315,176 @@ class TestFrontmatterDuplicateKeys:
             fm = parse_frontmatter(content)
             assert fm["name"] == "first"
             assert mock_logger.warning.call_count == 2
+
+
+# ── W18.1: Capability field-name typo detection ─────────────────────────
+
+
+class TestCapabilityFieldNameTypo:
+    """W18.1: Misspelled frontmatter KEY (e.g. 'capabilites:' instead of
+    'capabilities:') must be detected and blocked.
+
+    Without this fix, a misspelled key causes validate_capability_manifest
+    to see no 'capabilities' field, treating the skill as legacy (no
+    restrictions) — a fail-open bypass.
+    """
+
+    def test_capabilites_typo_blocked(self):
+        """Common transposition typo 'capabilites' must be caught."""
+        from openspace.skill_engine.skill_utils import validate_capability_manifest
+        content = "---\nname: evil\ncapabilites: network\n---\n# Skill"
+        error = validate_capability_manifest(content)
+        assert error is not None
+        assert "capabilites" in error
+        assert "typo" in error.lower()
+
+    def test_capablities_typo_blocked(self):
+        """Another common typo 'capablities' must be caught."""
+        from openspace.skill_engine.skill_utils import validate_capability_manifest
+        content = "---\nname: evil\ncapablities: subprocess\n---\n# Skill"
+        error = validate_capability_manifest(content)
+        assert error is not None
+        assert "capablities" in error
+
+    def test_capability_singular_blocked(self):
+        """Singular 'capability' (prefix 'capab') must be caught."""
+        from openspace.skill_engine.skill_utils import validate_capability_manifest
+        content = "---\nname: evil\ncapability: network\n---\n# Skill"
+        error = validate_capability_manifest(content)
+        assert error is not None
+        assert "capability" in error
+
+    def test_exact_capabilities_passes(self):
+        """Correct spelling 'capabilities' must NOT trigger typo detection."""
+        from openspace.skill_engine.skill_utils import validate_capability_manifest
+        content = "---\nname: ok\ncapabilities: network\n---\n# Skill"
+        assert validate_capability_manifest(content) is None
+
+    def test_no_capabilities_field_passes(self):
+        """Legacy skill with no capabilities-like key → passes (legacy OK)."""
+        from openspace.skill_engine.skill_utils import validate_capability_manifest
+        content = "---\nname: legacy\ndescription: old skill\n---\n# Skill"
+        assert validate_capability_manifest(content) is None
+
+    def test_cpabilities_edit_distance_blocked(self):
+        """Non-prefix typo 'cpabilities' (edit distance 1) must be caught."""
+        from openspace.skill_engine.skill_utils import validate_capability_manifest
+        content = "---\nname: evil\ncpabilities: network\n---\n# Skill"
+        error = validate_capability_manifest(content)
+        assert error is not None
+        assert "cpabilities" in error
+
+    def test_capabilities_with_typo_value_still_checks_values(self):
+        """Correct key + typo VALUE should still trigger value validation."""
+        from openspace.skill_engine.skill_utils import validate_capability_manifest
+        content = "---\nname: test\ncapabilities: netwerk\n---\n# Skill"
+        error = validate_capability_manifest(content)
+        assert error is not None
+        assert "netwerk" in error
+
+    def test_unrelated_key_not_flagged(self):
+        """Keys far from 'capabilities' must NOT trigger false positives."""
+        from openspace.skill_engine.skill_utils import validate_capability_manifest
+        content = "---\nname: test\ndescription: harmless\ntags: foo\n---\n# Skill"
+        assert validate_capability_manifest(content) is None
+
+    def test_is_near_capabilities_helper(self):
+        """Direct unit test of _is_near_capabilities."""
+        from openspace.skill_engine.skill_utils import _is_near_capabilities
+        # Near-misses that should match
+        assert _is_near_capabilities("capabilites") is True
+        assert _is_near_capabilities("capablities") is True
+        assert _is_near_capabilities("capability") is True
+        assert _is_near_capabilities("capabilitie") is True
+        assert _is_near_capabilities("cpabilities") is True
+        # Exact match should NOT match (it's not a typo)
+        assert _is_near_capabilities("capabilities") is False
+        # Far away should NOT match
+        assert _is_near_capabilities("name") is False
+        assert _is_near_capabilities("description") is False
+        assert _is_near_capabilities("tags") is False
+        assert _is_near_capabilities("version") is False
+
+    def test_discover_blocks_typo_key(self, tmp_path):
+        """Registry.discover() must block skills with typo capability keys."""
+        from openspace.skill_engine.registry import SkillRegistry
+        skill_dir = tmp_path / "typo_key_skill"
+        skill_dir.mkdir()
+        (skill_dir / "SKILL.md").write_text(
+            "---\nname: typo_key_skill\ndescription: desc\n"
+            "capabilites: network\n---\n# Skill\nBody",
+            encoding="utf-8",
+        )
+        registry = SkillRegistry(skill_dirs=[tmp_path])
+        skills = registry.discover()
+        assert not any(s.name == "typo_key_skill" for s in skills)
+
+
+# ── W18.1: set_frontmatter_field dedup ───────────────────────────────────
+
+
+class TestSetFrontmatterFieldDedup:
+    """W18.1: set_frontmatter_field must replace the FIRST occurrence of
+    a duplicate key and DROP subsequent duplicates, not produce multiple
+    identical output lines.
+    """
+
+    def test_single_key_replaced_normally(self):
+        """Non-duplicate key → normal replacement."""
+        from openspace.skill_engine.skill_utils import set_frontmatter_field
+        content = "---\nname: old\ndescription: desc\n---\nBody"
+        result = set_frontmatter_field(content, "name", "new")
+        assert "name: new" in result
+        assert result.count("name:") == 1
+
+    def test_duplicate_key_deduplicated(self):
+        """Duplicate keys → first replaced, subsequent dropped."""
+        from openspace.skill_engine.skill_utils import set_frontmatter_field
+        content = "---\nname: first\ndescription: desc\nname: second\n---\nBody"
+        result = set_frontmatter_field(content, "name", "updated")
+        assert result.count("name:") == 1
+        assert "name: updated" in result
+
+    def test_triple_duplicate_deduplicated(self):
+        """Triple duplicate → only one line survives."""
+        from openspace.skill_engine.skill_utils import set_frontmatter_field
+        content = "---\nname: a\nname: b\nname: c\n---\nBody"
+        result = set_frontmatter_field(content, "name", "final")
+        assert result.count("name:") == 1
+        assert "name: final" in result
+
+    def test_dedup_preserves_other_fields(self):
+        """Dedup of one key must not affect other fields."""
+        from openspace.skill_engine.skill_utils import set_frontmatter_field
+        content = "---\nname: a\ndescription: keep\nname: b\ntags: keep\n---\nBody"
+        result = set_frontmatter_field(content, "name", "new")
+        assert "description: keep" in result
+        assert "tags: keep" in result
+        assert result.count("name:") == 1
+
+    def test_dedup_logs_warning(self):
+        """Dropping duplicate keys must log a warning."""
+        from unittest import mock
+        from openspace.skill_engine.skill_utils import set_frontmatter_field
+        content = "---\nname: a\nname: b\n---\nBody"
+        with mock.patch("openspace.skill_engine.skill_utils.logger") as mock_logger:
+            set_frontmatter_field(content, "name", "new")
+            mock_logger.warning.assert_called_once()
+            assert "duplicate" in mock_logger.warning.call_args[0][0].lower()
+
+    def test_no_duplicate_no_warning(self):
+        """Single key → no warning."""
+        from unittest import mock
+        from openspace.skill_engine.skill_utils import set_frontmatter_field
+        content = "---\nname: only\ndescription: desc\n---\nBody"
+        with mock.patch("openspace.skill_engine.skill_utils.logger") as mock_logger:
+            set_frontmatter_field(content, "name", "new")
+            mock_logger.warning.assert_not_called()
+
+    def test_insert_new_field_works(self):
+        """Field not present → appended (no dedup needed)."""
+        from openspace.skill_engine.skill_utils import set_frontmatter_field
+        content = "---\nname: test\n---\nBody"
+        result = set_frontmatter_field(content, "version", "1.0")
+        assert "version: 1.0" in result
+        assert "name: test" in result

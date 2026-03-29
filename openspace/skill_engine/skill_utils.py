@@ -248,8 +248,17 @@ def set_frontmatter_field(content: str, field_name: str, value: str) -> str:
     new_lines = []
     for line in fm_text.split("\n"):
         if ":" in line and line.split(":", 1)[0].strip() == field_name:
-            new_lines.append(new_line)
-            found = True
+            if not found:
+                new_lines.append(new_line)
+                found = True
+            else:
+                # W18.1: Drop duplicate keys instead of replacing all
+                # (which would produce multiple identical lines).
+                logger.warning(
+                    "set_frontmatter_field: dropping duplicate key '%s' "
+                    "(possible injection attempt)",
+                    field_name,
+                )
         else:
             new_lines.append(line)
     if not found:
@@ -451,6 +460,40 @@ _CAPABILITY_DETECTORS: List[tuple[str, re.Pattern]] = [
 ]
 
 
+def _is_near_capabilities(key: str) -> bool:
+    """Return True if *key* looks like a typo of ``capabilities``.
+
+    W18.1: Detects frontmatter keys that are near-misses (edit distance <= 2
+    or ``capab`` prefix) to prevent fail-open bypass where a misspelled KEY
+    (e.g. ``capabilites:``) causes the manifest validator to treat the skill
+    as legacy (no capabilities = no restrictions).
+    """
+    target = "capabilities"
+    if key == target:
+        return False  # exact match — not a typo
+    key_lower = key.lower()
+    # Prefix check: covers capabilites, capablities, capability, etc.
+    if key_lower.startswith("capab"):
+        return True
+    # Edit distance check for non-prefix typos (e.g. "cpabilities")
+    if abs(len(key_lower) - len(target)) > 2:
+        return False
+    # Levenshtein distance (O(mn), but strings are ~12 chars — trivial)
+    m, n = len(key_lower), len(target)
+    dp = list(range(n + 1))
+    for i in range(1, m + 1):
+        prev = dp[0]
+        dp[0] = i
+        for j in range(1, n + 1):
+            temp = dp[j]
+            if key_lower[i - 1] == target[j - 1]:
+                dp[j] = prev
+            else:
+                dp[j] = 1 + min(prev, dp[j], dp[j - 1])
+            prev = temp
+    return dp[n] <= 2
+
+
 def parse_capabilities(content: str) -> frozenset[str]:
     """Parse ``capabilities`` field from SKILL.md frontmatter.
 
@@ -482,7 +525,23 @@ def validate_capability_manifest(content: str) -> Optional[str]:
     W18: Fixes the fail-open gap where typos like ``netwerk`` instead of
     ``network`` were silently ignored, causing the skill to run without
     the intended capability restriction.
+
+    W18.1: Also detects near-miss FIELD-NAME typos (e.g. ``capabilites:``
+    instead of ``capabilities:``) that previously caused the validator to
+    treat the skill as legacy (no restrictions).
     """
+    # W18.1: Check for near-miss field-name typos BEFORE checking values.
+    # A misspelled KEY (e.g. "capabilites:") causes get_frontmatter_field
+    # to return None, making the skill appear legacy (no restrictions).
+    fm = parse_frontmatter(content)
+    for key in fm:
+        if _is_near_capabilities(key):
+            return (
+                f"Frontmatter key '{key}' looks like a typo of 'capabilities' — "
+                f"please use the exact key 'capabilities'. "
+                f"Blocking skill to prevent fail-open capability bypass."
+            )
+
     raw = get_frontmatter_field(content, "capabilities")
     if not raw:
         return None  # no capabilities declared = legacy, OK

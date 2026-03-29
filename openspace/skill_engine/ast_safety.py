@@ -229,9 +229,15 @@ class DangerousNodeVisitor(ast.NodeVisitor):
         self.generic_visit(node)
 
     def visit_AnnAssign(self, node: ast.AnnAssign) -> None:
-        """Track annotated assignment taint: ``x: Any = os.environ``."""
+        """Track annotated assignment taint: ``x: Any = os.environ``.
+
+        W19 C1: Also checks dangerous attribute assignments (e.g.
+        ``cls.pwn: object = os.system``), matching visit_Assign behaviour.
+        """
         if node.value:
             self._propagate_taint_target(node.target, node.value)
+            # W19 C1: Annotated attr assignments must also be checked
+            self._check_dangerous_attr_assign(node.target, node.value)
         self.generic_visit(node)
 
     def visit_NamedExpr(self, node: ast.NamedExpr) -> None:
@@ -467,13 +473,45 @@ class DangerousNodeVisitor(ast.NodeVisitor):
         if r is not None:
             return r
 
-        # Call: try to resolve the first positional argument
-        if isinstance(node, ast.Call) and node.args:
-            return self._peel_to_resolve(node.args[0])
+        # Call: check return taint first (W19 C2), then try first arg (W17 C1)
+        if isinstance(node, ast.Call):
+            # W19 C2: If callee has recorded return taint, use it.
+            # Catches: def make(): return os.system; f = make(); f("id")
+            callee_name = None
+            if isinstance(node.func, ast.Name):
+                callee_name = node.func.id
+            elif isinstance(node.func, ast.Attribute):
+                callee_name = _resolve_attr_chain(node.func)
+            if callee_name:
+                # Resolve through aliases in case callee is aliased
+                resolved_callee = self._name_aliases.get(callee_name, callee_name)
+                taint = (
+                    self._func_return_taint.get(resolved_callee)
+                    or self._func_return_taint.get(callee_name)
+                )
+                if taint is not None:
+                    return taint
+            # Existing W17 C1: try to resolve first positional argument
+            if node.args:
+                return self._peel_to_resolve(node.args[0])
 
         # NamedExpr: (x := dangerous)
         if isinstance(node, ast.NamedExpr):
             return self._peel_to_resolve(node.value)
+
+        # W19 C4: Lambda — resolve body expression
+        # Catches: return (lambda: os.system) where the lambda wraps a dangerous value
+        if isinstance(node, ast.Lambda):
+            return self._peel_to_resolve(node.body)
+
+        # W19 C3: Dict with dangerous values — taint propagates through the dict
+        # Catches: ns = {"run": os.system}; type("C", (), ns)
+        if isinstance(node, ast.Dict):
+            for val in node.values:
+                if val is not None:
+                    r = self._peel_to_resolve(val)
+                    if r is not None and self._is_dangerous_resolved(r):
+                        return r
 
         # W17 H3: Subscript on dict literal: {"k": os.environ}["k"]
         if isinstance(node, ast.Subscript) and isinstance(node.value, ast.Dict):
@@ -489,6 +527,16 @@ class DangerousNodeVisitor(ast.NodeVisitor):
                         and v is not None
                     ):
                         return self._peel_to_resolve(v)
+
+        # W19 H5: Subscript on Name that's aliased to a dangerous value
+        # Catches: d = {"k": os.environ}; d["k"].get("PASSWORD")
+        if isinstance(node, ast.Subscript) and isinstance(node.value, ast.Name):
+            resolved = (
+                self._name_aliases.get(node.value.id)
+                or self._module_aliases.get(node.value.id)
+            )
+            if resolved is not None and self._is_dangerous_resolved(resolved):
+                return resolved
 
         return None
 
@@ -545,12 +593,27 @@ class DangerousNodeVisitor(ast.NodeVisitor):
         """W17 C2: Flag attribute assignments where value is a dangerous callable.
 
         Catches: cls.pwn = staticmethod(os.system), self.run = subprocess.call
+
+        W19 C1: Also descends into Tuple/List destructuring to find
+        attribute leaves.  ``(cls.pwn,) = (os.system,)`` is now caught.
         """
-        if not isinstance(target, ast.Attribute):
-            return
-        resolved = self._peel_to_resolve(value)
-        if resolved is not None and self._is_dangerous_resolved(resolved):
-            self.flags.append(self._flag_for_resolved(resolved))
+        if isinstance(target, ast.Attribute):
+            resolved = self._peel_to_resolve(value)
+            if resolved is not None and self._is_dangerous_resolved(resolved):
+                self.flags.append(self._flag_for_resolved(resolved))
+        elif isinstance(target, (ast.Tuple, ast.List)):
+            # W19 C1: Pair target elements with value elements if both are sequences
+            if (
+                isinstance(value, (ast.Tuple, ast.List))
+                and len(value.elts) == len(target.elts)
+            ):
+                for t, v in zip(target.elts, value.elts):
+                    elt = t.value if isinstance(t, ast.Starred) else t
+                    self._check_dangerous_attr_assign(elt, v)
+            else:
+                for t in target.elts:
+                    elt = t.value if isinstance(t, ast.Starred) else t
+                    self._check_dangerous_attr_assign(elt, value)
 
     def _scan_function_returns(
         self, node: ast.FunctionDef | ast.AsyncFunctionDef
@@ -566,33 +629,61 @@ class DangerousNodeVisitor(ast.NodeVisitor):
     def _check_decorator_taint(
         self, node: ast.FunctionDef | ast.AsyncFunctionDef
     ) -> None:
-        """W17 C4: If a decorator returns dangerous values, taint the decorated name."""
+        """W17 C4: If a decorator returns dangerous values, taint the decorated name.
+
+        W19 C4: Also handles Call decorators (``@deco_factory()``,
+        ``@X.dec()``) and resolves aliases through ``_name_aliases``.
+        """
         for deco in node.decorator_list:
             deco_name = None
             if isinstance(deco, ast.Name):
                 deco_name = deco.id
             elif isinstance(deco, ast.Attribute):
                 deco_name = _resolve_attr_chain(deco)
-            if deco_name is not None and deco_name in self._func_return_taint:
-                dangerous_val = self._func_return_taint[deco_name]
-                # Use same routing as _propagate_taint for alias storage
-                if (
-                    dangerous_val in self._module_aliases.values()
-                    or dangerous_val in _ALL_DANGEROUS_MODULES
-                    or dangerous_val in {"os", "sys", "builtins"}
-                ):
-                    self._module_aliases[node.name] = dangerous_val
-                else:
-                    self._name_aliases[node.name] = dangerous_val
+            # W19 C4: Call decorators: @deco_factory(), @X.dec()
+            elif isinstance(deco, ast.Call):
+                if isinstance(deco.func, ast.Name):
+                    deco_name = deco.func.id
+                elif isinstance(deco.func, ast.Attribute):
+                    deco_name = _resolve_attr_chain(deco.func)
+            if deco_name is None:
+                continue
+            # W19 C4: Resolve through name aliases (e.g. dec_alias = make)
+            resolved_name = self._name_aliases.get(deco_name, deco_name)
+            dangerous_val = (
+                self._func_return_taint.get(resolved_name)
+                or self._func_return_taint.get(deco_name)
+            )
+            if dangerous_val is None:
+                continue
+            # Use same routing as _propagate_taint for alias storage
+            if (
+                dangerous_val in self._module_aliases.values()
+                or dangerous_val in _ALL_DANGEROUS_MODULES
+                or dangerous_val in {"os", "sys", "builtins"}
+            ):
+                self._module_aliases[node.name] = dangerous_val
+            else:
+                self._name_aliases[node.name] = dangerous_val
 
     def _resolve_string_expr(self, node: ast.expr) -> Optional[str]:
-        """W17 H4: Resolve simple string expressions (constant or aliased name)."""
+        """W17 H4: Resolve simple string expressions (constant or aliased name).
+
+        W19 H6: Recursive BinOp(Add) folding for nested concatenation.
+        Catches: ``"__" + "glo" + "bals__"`` (parsed as nested BinOp).
+        """
         if isinstance(node, ast.Constant) and isinstance(node.value, str):
             return node.value
         if isinstance(node, ast.Name):
             val = self._name_aliases.get(node.id)
             if val is not None:
                 return val
+        # W19 H6: Recursive BinOp(Add) folding
+        if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
+            left = self._resolve_string_expr(node.left)
+            right = self._resolve_string_expr(node.right)
+            if left is not None and right is not None:
+                return left + right
         return None
 
     # --- Call analysis ---
@@ -630,6 +721,16 @@ class DangerousNodeVisitor(ast.NodeVisitor):
                         ):
                             self.flags.append(self._flag_for_resolved(resolved))
                             return
+            # W19 C3: Resolve Name reference to aliased dicts
+            # Catches: ns = {"run": os.system}; type("C", (), ns)
+            elif isinstance(dict_arg, ast.Name):
+                resolved = (
+                    self._name_aliases.get(dict_arg.id)
+                    or self._module_aliases.get(dict_arg.id)
+                )
+                if resolved is not None and self._is_dangerous_resolved(resolved):
+                    self.flags.append(self._flag_for_resolved(resolved))
+                    return
             return
 
         # getattr on a dangerous module: getattr(os, "system")
