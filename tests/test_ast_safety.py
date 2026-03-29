@@ -2694,3 +2694,221 @@ class TestW25StarredMiddleOverTaint:
         )
         # Union semantics: any dangerous in starred → whole starred tainted
         assert check_ast_safety(src) != []
+
+
+# =====================================================================
+# W26 Codex W24 Findings: CRITs + HIGHs
+# =====================================================================
+
+
+class TestW26IndirectChrJoinDunderBypass:
+    """W26 C1: Indirect chr/join bypass dunder-string detection."""
+
+    def test_aliased_chr_dunder_bypass(self) -> None:
+        """from builtins import chr as c; getattr(object, c(95)+...) must flag."""
+        src = (
+            'import builtins\n'
+            'c = builtins.chr\n'
+            'getattr(object, c(95)+c(95)+"globals"+c(95)+c(95))\n'
+        )
+        assert check_ast_safety(src) != []
+
+    def test_variable_sep_join_dunder_bypass(self) -> None:
+        """sep = ""; getattr(object, sep.join([...])) must flag."""
+        src = (
+            'sep = ""\n'
+            'getattr(object, sep.join(["__", "globals__"]))\n'
+        )
+        assert check_ast_safety(src) != []
+
+    def test_direct_chr_still_caught(self) -> None:
+        """Direct chr() dunder construction — should already be caught."""
+        src = 'getattr(object, chr(95)+chr(95)+"globals"+chr(95)+chr(95))\n'
+        assert check_ast_safety(src) != []
+
+    def test_direct_literal_join_still_caught(self) -> None:
+        """Direct literal join — should already be caught."""
+        src = 'getattr(object, "".join(["__", "globals__"]))\n'
+        assert check_ast_safety(src) != []
+
+
+class TestW26BareGetattrAlias:
+    """W26 C2: g = getattr bypasses aliased-getattr router."""
+
+    def test_bare_getattr_alias_dunder(self) -> None:
+        """g = getattr; g(object, "__subclasses__")() must flag."""
+        src = (
+            'g = getattr\n'
+            'g(object, "__subclasses__")()\n'
+        )
+        assert check_ast_safety(src) != []
+
+    def test_bare_getattr_alias_os(self) -> None:
+        """g = getattr; g(os, "system")("id") must flag."""
+        src = (
+            'import os\n'
+            'g = getattr\n'
+            'g(os, "system")("id")\n'
+        )
+        assert check_ast_safety(src) != []
+
+    def test_from_import_getattr_still_caught(self) -> None:
+        """from builtins import getattr as g — already caught by W24 C2."""
+        src = (
+            'from builtins import getattr as g\n'
+            'g(os, "system")("id")\n'
+        )
+        assert check_ast_safety(src) != []
+
+
+class TestW26MethodReturnTaint:
+    """W26 C3: Method-return taint lost for classmethod/staticmethod."""
+
+    def test_staticmethod_returns_environ(self) -> None:
+        """Class staticmethod returning os.environ — .get() must flag."""
+        src = (
+            'import os\n'
+            'class P:\n'
+            '    @staticmethod\n'
+            '    def p():\n'
+            '        return os.environ\n'
+            'P.p().get("PASSWORD")\n'
+        )
+        assert check_ast_safety(src) != []
+
+    def test_classmethod_returns_builtins(self) -> None:
+        """Class method returning builtins — getattr must flag."""
+        src = (
+            'import builtins\n'
+            'class C:\n'
+            '    @classmethod\n'
+            '    def b(cls):\n'
+            '        return builtins\n'
+            'getattr(C.b(), "eval")("1+1")\n'
+        )
+        assert check_ast_safety(src) != []
+
+    def test_plain_method_returns_system(self) -> None:
+        """Plain method returning os.system — call must flag."""
+        src = (
+            'import os\n'
+            'class F:\n'
+            '    def get_fn(self):\n'
+            '        return os.system\n'
+            'F().get_fn()("id")\n'
+        )
+        assert check_ast_safety(src) != []
+
+
+class TestW26CallProducedBuiltinsAttr:
+    """W26 C4: Direct attribute calls on call-produced builtins objects."""
+
+    def test_func_returns_builtins_eval(self) -> None:
+        """def b(): return builtins; b().eval("1+1") must flag."""
+        src = (
+            'import builtins\n'
+            'def b():\n'
+            '    return builtins\n'
+            'b().eval("1+1")\n'
+        )
+        assert check_ast_safety(src) != []
+
+    def test_func_returns_builtins_exec(self) -> None:
+        """def b(): return builtins; b().exec("...") must flag."""
+        src = (
+            'import builtins\n'
+            'def b():\n'
+            '    return builtins\n'
+            'b().exec("import os")\n'
+        )
+        assert check_ast_safety(src) != []
+
+    def test_lambda_returns_builtins(self) -> None:
+        """(lambda: builtins)().eval("1+1") must flag."""
+        src = (
+            'import builtins\n'
+            '(lambda: builtins)().eval("1+1")\n'
+        )
+        assert check_ast_safety(src) != []
+
+
+class TestW26PathAssignmentBypass:
+    """W26 H1: Path assignment then read_text/read_bytes bypass."""
+
+    def test_path_assigned_then_read_text(self) -> None:
+        """p = Path(".../.ssh/id_rsa"); p.read_text() must flag."""
+        src = (
+            'from pathlib import Path\n'
+            'p = Path("/home/user/.ssh/id_rsa")\n'
+            'p.read_text()\n'
+        )
+        assert check_ast_safety(src) != []
+
+    def test_path_assigned_then_read_bytes(self) -> None:
+        """p = Path(".../.env"); p.read_bytes() must flag."""
+        src = (
+            'from pathlib import Path\n'
+            'p = Path("/app/.env")\n'
+            'p.read_bytes()\n'
+        )
+        assert check_ast_safety(src) != []
+
+    def test_path_expanduser_chain(self) -> None:
+        """Path("~/.ssh/id_rsa").expanduser().read_text() must flag."""
+        src = (
+            'from pathlib import Path\n'
+            'Path("~/.ssh/id_rsa").expanduser().read_text()\n'
+        )
+        assert check_ast_safety(src) != []
+
+
+class TestW26EnvironBoundMethodExtraction:
+    """W26 H2: os.environ bound method extraction bypass."""
+
+    def test_environ_get_extracted(self) -> None:
+        """getter = os.environ.get; getter("PASSWORD") must flag."""
+        src = (
+            'import os\n'
+            'getter = os.environ.get\n'
+            'getter("PASSWORD")\n'
+        )
+        assert check_ast_safety(src) != []
+
+    def test_lambda_wrapped_environ_get(self) -> None:
+        """getter = (lambda x: x)(os.environ).get; getter("P") must flag."""
+        src = (
+            'import os\n'
+            'getter = (lambda x: x)(os.environ).get\n'
+            'getter("PASSWORD")\n'
+        )
+        assert check_ast_safety(src) != []
+
+
+class TestW26BuiltinsOpenDangerous:
+    """W26 H3: builtins.open not in dangerous-resolution helpers."""
+
+    def test_getattr_builtins_open(self) -> None:
+        """getattr(builtins, "open")("/etc/passwd") must flag."""
+        src = (
+            'import builtins\n'
+            'getattr(builtins, "open")("/etc/passwd")\n'
+        )
+        assert check_ast_safety(src) != []
+
+    def test_func_returns_builtins_getattr_open(self) -> None:
+        """def b(): return builtins; getattr(b(), "open")(...) must flag."""
+        src = (
+            'import builtins\n'
+            'def b():\n'
+            '    return builtins\n'
+            'getattr(b(), "open")("/etc/passwd")\n'
+        )
+        assert check_ast_safety(src) != []
+
+    def test_direct_builtins_open_still_caught(self) -> None:
+        """builtins.open("/etc/passwd") — should already be caught."""
+        src = (
+            'import builtins\n'
+            'builtins.open("/etc/passwd")\n'
+        )
+        assert check_ast_safety(src) != []

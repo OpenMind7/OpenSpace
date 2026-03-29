@@ -480,6 +480,13 @@ class DangerousNodeVisitor(ast.NodeVisitor):
                             self._class_attr_taint[derived_key] = value
                             self._name_aliases[derived_key] = value
         self.generic_visit(node)
+        # W26 C3: Promote method return taint to qualified names
+        # After generic_visit so FunctionDef children have been processed
+        for stmt in node.body:
+            if isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                if stmt.name in self._func_return_taint:
+                    qual = f"{class_name}.{stmt.name}"
+                    self._func_return_taint[qual] = self._func_return_taint[stmt.name]
 
     @staticmethod
     def _resolve_attribute_chain(node: ast.expr) -> Optional[str]:
@@ -776,6 +783,10 @@ class DangerousNodeVisitor(ast.NodeVisitor):
                 return "builtins.__import__"
             if name == "__builtins__":
                 return "__builtins__"
+            # W26 C2: getattr is taintable so g = getattr; g(obj, attr) routes
+            # through the aliased-getattr handler
+            if name == "getattr":
+                return "builtins.getattr"
             return None
 
         if isinstance(node, ast.Attribute):
@@ -836,6 +847,17 @@ class DangerousNodeVisitor(ast.NodeVisitor):
                 callee_name = node.func.id
             elif isinstance(node.func, ast.Attribute):
                 callee_name = _resolve_attr_chain(node.func)
+            # W26 C3: X().method() — resolve inner Call to class, build qualified name
+            if callee_name is None and isinstance(node.func, ast.Attribute):
+                inner = node.func.value
+                inner_callee = None
+                if isinstance(inner, ast.Call):
+                    if isinstance(inner.func, ast.Name):
+                        inner_callee = inner.func.id
+                    elif isinstance(inner.func, ast.Attribute):
+                        inner_callee = _resolve_attr_chain(inner.func)
+                if inner_callee is not None:
+                    callee_name = f"{inner_callee}.{node.func.attr}"
             if callee_name:
                 # Resolve through aliases in case callee is aliased
                 resolved_callee = self._name_aliases.get(callee_name, callee_name)
@@ -951,7 +973,8 @@ class DangerousNodeVisitor(ast.NodeVisitor):
             if module_part == "asyncio" and func_name in _DANGEROUS_ASYNCIO_FUNCS:
                 return True
             if module_part == "builtins" and (
-                func_name in _BLANKET_BLOCKED_BUILTINS or func_name == "__import__"
+                func_name in _BLANKET_BLOCKED_BUILTINS
+                or func_name in ("__import__", "open")
             ):
                 return True
             root = module_part.split(".")[0]
@@ -1133,6 +1156,11 @@ class DangerousNodeVisitor(ast.NodeVisitor):
                 sep = None
                 if isinstance(receiver, ast.Constant) and isinstance(receiver.value, str):
                     sep = receiver.value
+                # W26 C1: Variable separator — resolve Name through _name_aliases
+                elif isinstance(receiver, ast.Name):
+                    alias_val = self._name_aliases.get(receiver.id)
+                    if isinstance(alias_val, str):
+                        sep = alias_val
                 if sep is not None:
                     arg = node.args[0]
                     if isinstance(arg, (ast.List, ast.Tuple)):
@@ -1160,18 +1188,24 @@ class DangerousNodeVisitor(ast.NodeVisitor):
                     return None
             return "".join(parts)
         # W20.1: chr(N) → single character (string construction bypass)
+        # W26 C1: Also handles aliased chr (c = builtins.chr; c(95))
         if (
             isinstance(node, ast.Call)
             and isinstance(node.func, ast.Name)
-            and node.func.id == "chr"
             and len(node.args) == 1
             and isinstance(node.args[0], ast.Constant)
             and isinstance(node.args[0].value, int)
         ):
-            try:
-                return chr(node.args[0].value)
-            except (ValueError, OverflowError):
-                return None
+            callee_id = node.func.id
+            is_chr = callee_id == "chr"
+            if not is_chr:
+                alias = self._name_aliases.get(callee_id)
+                is_chr = alias in ("chr", "builtins.chr")
+            if is_chr:
+                try:
+                    return chr(node.args[0].value)
+                except (ValueError, OverflowError):
+                    return None
         # W20.1: string * int or int * string (repetition bypass)
         if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Mult):
             left = self._resolve_string_expr(node.left)
@@ -1291,6 +1325,11 @@ class DangerousNodeVisitor(ast.NodeVisitor):
                             if fragment in path_lower:
                                 self.flags.append("blocked.credential_exfil")
                                 break
+            # W26 C4: Call-produced objects — resolve receiver, check qualified call
+            else:
+                receiver_resolved = self._peel_to_resolve(func.value)
+                if receiver_resolved is not None:
+                    self._check_qualified_call(f"{receiver_resolved}.{func.attr}")
             return
 
         # Resolve the root through module aliases
