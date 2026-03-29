@@ -671,3 +671,83 @@ class TestAdversarialW12:
         src = "x = getattr(my_obj, 'some_attr')"
         flags = check_ast_safety(src)
         assert not any(f.startswith("blocked.") for f in flags)
+
+    # --- W14: Codex-identified bypass fixes ---
+
+    def test_builtins_get_import(self) -> None:
+        """CRIT: __builtins__.get('__import__')('os') must be blocked."""
+        src = "__builtins__.get('__import__')('os')"
+        flags = check_ast_safety(src)
+        assert "blocked.shell_injection" in flags
+
+    def test_builtins_pop_import(self) -> None:
+        """CRIT: __builtins__.pop('__import__') must be blocked."""
+        src = "__builtins__.pop('__import__')"
+        flags = check_ast_safety(src)
+        assert "blocked.shell_injection" in flags
+
+    def test_builtins_values(self) -> None:
+        """CRIT: __builtins__.values() must be blocked."""
+        src = "__builtins__.values()"
+        flags = check_ast_safety(src)
+        assert "blocked.shell_injection" in flags
+
+    def test_dict_builtins_import(self) -> None:
+        """CRIT: dict(__builtins__)['__import__']('os') must be blocked."""
+        src = "dict(__builtins__)['__import__']('os')"
+        flags = check_ast_safety(src)
+        assert "blocked.shell_injection" in flags
+
+    def test_list_builtins(self) -> None:
+        """CRIT: list(__builtins__) must be blocked."""
+        src = "list(__builtins__)"
+        flags = check_ast_safety(src)
+        assert "blocked.shell_injection" in flags
+
+    def test_getattr_builtins_get(self) -> None:
+        """CRIT: getattr(__builtins__, 'get')('__import__')('sys') must be blocked."""
+        src = "getattr(__builtins__, 'get')('__import__')('sys')"
+        flags = check_ast_safety(src)
+        assert "blocked.shell_injection" in flags
+
+    def test_getattr_sys_getframe(self) -> None:
+        """CRIT: getattr(sys, '_getframe')(0) must be blocked."""
+        src = "import sys\ngetattr(sys, '_getframe')(0)"
+        flags = check_ast_safety(src)
+        assert "blocked.shell_injection" in flags
+
+    def test_getattr_sys_modules(self) -> None:
+        """CRIT: getattr(sys, 'modules') must be blocked."""
+        src = "import sys\ngetattr(sys, 'modules')"
+        flags = check_ast_safety(src)
+        assert "blocked.shell_injection" in flags
+
+    def test_getattr_sys_dynamic(self) -> None:
+        """CRIT: getattr(sys, dynamic_var) must be blocked (fail-closed)."""
+        src = "import sys\ngetattr(sys, x)"
+        flags = check_ast_safety(src)
+        assert "blocked.shell_injection" in flags
+
+    def test_getattr_os_environ_get(self) -> None:
+        """HIGH: getattr(os.environ, 'get')('PASSWORD') must be blocked."""
+        src = "import os\ngetattr(os.environ, 'get')('PASSWORD')"
+        flags = check_ast_safety(src)
+        assert "blocked.credential_exfil" in flags
+
+    def test_getattr_os_environ_items(self) -> None:
+        """HIGH: getattr(os.environ, 'items')() must be blocked."""
+        src = "import os\ngetattr(os.environ, 'items')()"
+        flags = check_ast_safety(src)
+        assert "blocked.credential_exfil" in flags
+
+    def test_getattr_os_environ_dynamic(self) -> None:
+        """HIGH: getattr(os.environ, dynamic) must be blocked (fail-closed)."""
+        src = "import os\ngetattr(os.environ, x)"
+        flags = check_ast_safety(src)
+        assert "blocked.credential_exfil" in flags
+
+    def test_getattr_sys_safe_attr_no_flag(self) -> None:
+        """Safe: getattr(sys, 'version') must NOT be blocked."""
+        src = "import sys\ngetattr(sys, 'version')"
+        flags = check_ast_safety(src)
+        assert not any(f.startswith("blocked.") for f in flags)

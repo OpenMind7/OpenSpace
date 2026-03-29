@@ -13,6 +13,7 @@ use identical protections.
 from __future__ import annotations
 
 import os
+import re
 import stat
 import tempfile
 from typing import Dict, FrozenSet, Optional, Tuple
@@ -63,14 +64,70 @@ _DANGEROUS_ENV_VARS: FrozenSet[str] = frozenset({
     "PERL5OPT",
 })
 
+# W14: Injection-class vars that should be stripped from inherited parent env.
+# Excludes PATH/SHELL which are needed for basic subprocess execution.
+_INJECTION_ENV_VARS: FrozenSet[str] = frozenset({
+    "BASH_ENV", "ENV", "CDPATH",
+    "PYTHONPATH", "PYTHONSTARTUP", "PYTHONHOME",
+    "DEBUGINFOD_URLS", "MALLOC_CHECK_",
+    "ASAN_OPTIONS", "TSAN_OPTIONS", "MSAN_OPTIONS", "UBSAN_OPTIONS",
+    "RUBYLIB", "NODE_PATH", "NODE_OPTIONS",
+    "PERL5LIB", "PERL5OPT",
+})
+
+# W14: Conda environment name validation (Codex CRIT — shell injection via conda_env)
+_CONDA_ENV_RE = re.compile(r'^[a-zA-Z0-9][a-zA-Z0-9._-]*$')
+
+
+def validate_conda_env(conda_env: Optional[str]) -> Optional[str]:
+    """Validate conda environment name against shell injection.
+
+    Returns the validated name, or None if empty.
+    Raises ValueError if the name contains injection characters.
+    """
+    if not conda_env:
+        return None
+    if len(conda_env) > 128:
+        raise ValueError(f"Conda environment name too long: {len(conda_env)} chars")
+    if not _CONDA_ENV_RE.match(conda_env):
+        raise ValueError(
+            f"Invalid conda environment name: {conda_env!r} — "
+            "must match [a-zA-Z0-9._-]+"
+        )
+    return conda_env
+
 
 def sanitize_env(user_env: Optional[Dict[str, str]]) -> Dict[str, str]:
     """Merge *user_env* into ``os.environ`` after stripping dangerous keys.
 
     Returns a **new** dict (never mutates the original).  Logs a warning for
     every blocked key so that callers can audit.
+
+    W14: Also strips injection-class vars from the inherited parent environment
+    (LD_*, DYLD_*, BASH_FUNC_*, PYTHON*, BASH_ENV, etc.). PATH/SHELL are
+    preserved in the base since they're needed for subprocess execution.
     """
     base = os.environ.copy()
+
+    # W14: Scrub injection-class vars from inherited parent env (Codex HIGH)
+    inherited_blocked = []
+    for key in list(base.keys()):
+        upper_key = key.upper()
+        if (
+            upper_key in _INJECTION_ENV_VARS
+            or upper_key.startswith("LD_")
+            or upper_key.startswith("DYLD_")
+            or upper_key.startswith("BASH_FUNC_")
+        ):
+            del base[key]
+            inherited_blocked.append(key)
+    if inherited_blocked:
+        logger.warning(
+            "Stripped %d dangerous inherited env var(s): %s",
+            len(inherited_blocked),
+            ", ".join(sorted(inherited_blocked)),
+        )
+
     if not user_env:
         return base
 

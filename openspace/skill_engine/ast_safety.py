@@ -283,6 +283,11 @@ class DangerousNodeVisitor(ast.NodeVisitor):
         if module_part == "builtins" and func_name in _DANGEROUS_DUNDER_ATTRS:
             self.flags.append("blocked.shell_injection")
             return
+        # W14: __builtins__ is a dangerous mapping — any method call enables
+        # sandbox escape (e.g., __builtins__.get('__import__'), .pop(), .values())
+        if module_part == "__builtins__":
+            self.flags.append("blocked.shell_injection")
+            return
 
         # os.dangerous_func() — shell execution
         if module_part == "os" and func_name in _DANGEROUS_OS_FUNCS:
@@ -369,6 +374,27 @@ class DangerousNodeVisitor(ast.NodeVisitor):
                     resolved_mod = chain
 
         if resolved_mod is None:
+            return
+
+        # W14: __builtins__ is a dangerous mapping — any getattr is shell injection
+        if resolved_mod == "__builtins__":
+            self.flags.append("blocked.shell_injection")
+            return
+
+        # W14: getattr(sys, attr) — check _DANGEROUS_SYS_ATTRS (Codex CRIT)
+        if resolved_mod == "sys":
+            if attr_arg is None:
+                self.flags.append("blocked.shell_injection")
+            elif attr_arg in _DANGEROUS_SYS_ATTRS:
+                self.flags.append("blocked.shell_injection")
+            return
+
+        # W14: getattr(os.environ, method) — check environ methods (Codex HIGH)
+        if resolved_mod == "os.environ":
+            if attr_arg is None:
+                self.flags.append("blocked.credential_exfil")
+            elif attr_arg in _DANGEROUS_OS_ENVIRON_METHODS:
+                self.flags.append("blocked.credential_exfil")
             return
 
         if resolved_mod in _ALL_DANGEROUS_MODULES or resolved_mod == "os":
@@ -481,12 +507,18 @@ class DangerousNodeVisitor(ast.NodeVisitor):
 
     def _check_environ_containerization(self, node: ast.Call) -> None:
         """W12.3: Detect dict(os.environ), list(os.environ.items()), etc.
+        W14: Also detect dict(__builtins__) — sandbox escape via mapping copy.
 
         Catches whole-environment copy patterns that bypass per-key checks.
         """
         if not node.args:
             return
         arg = node.args[0]
+
+        # W14: dict(__builtins__) / list(__builtins__) — sandbox escape (Codex CRIT)
+        if isinstance(arg, ast.Name) and arg.id == "__builtins__":
+            self.flags.append("blocked.shell_injection")
+            return
 
         # dict(os.environ) or list(os.environ)
         if self._is_os_environ_expr(arg):
