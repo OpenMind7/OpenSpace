@@ -5,7 +5,7 @@ dangerous operations (shell injection, credential exfiltration), and handles eva
 vectors that regex screening cannot catch (alias tracking, dynamic imports, attribute
 chains).
 
-8 test groups, 68 cases:
+8 test groups, 78 cases:
   1. Evasion vectors (15)  — attacks that bypass regex but AST catches
   2. Alias tracking (5)    — import-as, from-import-as, chained aliases
   3. Markdown extraction (7) — fenced code blocks, heredocs, edge cases
@@ -13,7 +13,7 @@ chains).
   5. Syntax errors (3)     — malformed Python handled gracefully
   6. Backward compat (4)   — AST flags use same names as existing regex flags
   7. Performance (2)        — large inputs don't hang or OOM
-  8. Adversarial coverage (24) — S9 + W12.1: targeted tests for security fixes
+  8. Adversarial coverage (34) — S9 + W12.1 + W12.2 (Codex findings)
 """
 
 from __future__ import annotations
@@ -540,5 +540,66 @@ class TestAdversarialW12:
     def test_gc_module_blocked(self) -> None:
         """gc.get_objects() — enumerates live objects in memory."""
         src = "import gc\nobjs = gc.get_objects()"
+        flags = check_ast_safety(src)
+        assert "blocked.shell_injection" in flags
+
+    # --- W12.2: Codex-found bypass vectors ---
+
+    def test_getattr_dunder_subclasses_any_object(self) -> None:
+        """CRITICAL: getattr(object, '__subclasses__') must be blocked on ANY receiver."""
+        flags = check_ast_safety('getattr(object, "__subclasses__")()')
+        assert "blocked.shell_injection" in flags
+
+    def test_getattr_dunder_globals_any_object(self) -> None:
+        """CRITICAL: getattr(f, '__globals__') on arbitrary object."""
+        src = "def f(): pass\ngetattr(f, '__globals__')"
+        flags = check_ast_safety(src)
+        assert "blocked.shell_injection" in flags
+
+    def test_getattr_os_getenv_bypass(self) -> None:
+        """HIGH: getattr(os, 'getenv') must be caught as credential_exfil."""
+        src = "import os\ngetattr(os, 'getenv')('API_KEY')"
+        flags = check_ast_safety(src)
+        assert "blocked.credential_exfil" in flags
+
+    def test_getattr_os_environ_bypass(self) -> None:
+        """HIGH: getattr(os, 'environ') is gateway to credential access."""
+        src = "import os\ngetattr(os, 'environ').get('API_KEY')"
+        flags = check_ast_safety(src)
+        assert "blocked.credential_exfil" in flags
+
+    def test_builtins_dict_import_bypass(self) -> None:
+        """HIGH: builtins.__dict__['__import__'] must be blocked via __dict__ dunder."""
+        src = 'import builtins\nmod = builtins.__dict__["__import__"]("subprocess")'
+        flags = check_ast_safety(src)
+        assert "blocked.shell_injection" in flags
+
+    def test_from_os_import_environ_get(self) -> None:
+        """HIGH: from os import environ; environ.get('KEY') — alias resolution."""
+        src = "from os import environ\npw = environ.get('PASSWORD')"
+        flags = check_ast_safety(src)
+        assert "blocked.credential_exfil" in flags
+
+    def test_from_os_import_environ_subscript(self) -> None:
+        """HIGH: from os import environ; environ['SECRET_KEY'] — aliased subscript."""
+        src = "from os import environ\nk = environ['SECRET_KEY']"
+        flags = check_ast_safety(src)
+        assert "blocked.credential_exfil" in flags
+
+    def test_from_os_import_environ_as_alias_subscript(self) -> None:
+        """HIGH: from os import environ as e; e['API_KEY'] — double alias."""
+        src = "from os import environ as e\nk = e['API_KEY']"
+        flags = check_ast_safety(src)
+        assert "blocked.credential_exfil" in flags
+
+    def test_from_os_import_environ_pop(self) -> None:
+        """HIGH: from os import environ; environ.pop('TOKEN')."""
+        src = "from os import environ\ntok = environ.pop('TOKEN')"
+        flags = check_ast_safety(src)
+        assert "blocked.credential_exfil" in flags
+
+    def test_getattr_dunder_dict_any_object(self) -> None:
+        """HIGH: getattr(builtins, '__dict__') must be blocked."""
+        src = "import builtins\nd = getattr(builtins, '__dict__')"
         flags = check_ast_safety(src)
         assert "blocked.shell_injection" in flags

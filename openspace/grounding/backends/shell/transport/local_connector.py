@@ -12,13 +12,17 @@ import asyncio
 import os
 import platform
 import signal
-import tempfile
-import uuid
 from typing import Any, Optional, Dict
 
 from openspace.grounding.core.transport.connectors.base import BaseConnector
 from openspace.grounding.core.transport.task_managers.noop import NoOpConnectionManager
 from openspace.grounding.core.security import SecurityPolicyManager
+from openspace.local_server.subprocess_safety import (
+    sanitize_env,
+    create_secure_temp_file,
+    BASH_RLIMIT_PREAMBLE,
+    PYTHON_RLIMIT_PREAMBLE,
+)
 from openspace.utils.logging import Logger
 
 logger = Logger.get_logger(__name__)
@@ -96,42 +100,13 @@ def _wrap_script_with_conda(script: str, conda_env: str | None) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Resource limit preambles (Gate Patch 6)
+# Resource limit preambles — re-exported from subprocess_safety (Gate Patch 6)
 # ---------------------------------------------------------------------------
 # asyncio.create_subprocess_exec does not support preexec_fn, so we inject
 # resource-limit code into the temp scripts themselves.
-
-_BASH_RLIMIT_PREAMBLE = """\
-# --- OpenSpace resource limits ---
-ulimit -t 300 2>/dev/null    # CPU time (seconds)
-ulimit -v 2097152 2>/dev/null  # Virtual memory (KB) — 2 GB
-ulimit -f 512000 2>/dev/null   # Max file size (KB blocks) — 500 MB
-ulimit -n 1024 2>/dev/null     # Open file descriptors
-# --- end resource limits ---
-"""
-
-_PYTHON_RLIMIT_PREAMBLE = """\
-# --- OpenSpace resource limits ---
-import resource as _os_rlimit
-for _res, _lim in [
-    (_os_rlimit.RLIMIT_CPU, (300, 300)),
-    (_os_rlimit.RLIMIT_FSIZE, (500 * 1024 * 1024, 500 * 1024 * 1024)),
-    (_os_rlimit.RLIMIT_NOFILE, (1024, 1024)),
-]:
-    try:
-        _os_rlimit.setrlimit(_res, _lim)
-    except (ValueError, OSError):
-        pass
-# RLIMIT_AS is unsupported on macOS — only set on Linux
-import sys as _os_sys
-if _os_sys.platform == "linux":
-    try:
-        _os_rlimit.setrlimit(_os_rlimit.RLIMIT_AS, (2 * 1024**3, 2 * 1024**3))
-    except (ValueError, OSError):
-        pass
-del _os_rlimit, _os_sys, _res, _lim
-# --- end resource limits ---
-"""
+# Single source of truth: openspace.local_server.subprocess_safety
+_BASH_RLIMIT_PREAMBLE = BASH_RLIMIT_PREAMBLE
+_PYTHON_RLIMIT_PREAMBLE = PYTHON_RLIMIT_PREAMBLE
 
 
 class LocalShellConnector(BaseConnector[Any]):
@@ -183,9 +158,8 @@ class LocalShellConnector(BaseConnector[Any]):
     ) -> Dict[str, Any]:
         """Run a command via asyncio subprocess and return a result dict
         matching the format returned by the local_server endpoints."""
-        exec_env = os.environ.copy()
-        if env:
-            exec_env.update(env)
+        # W13: use shared env sanitization instead of raw merge
+        exec_env = sanitize_env(env)
 
         cwd = working_dir or os.getcwd()
 
@@ -248,9 +222,8 @@ class LocalShellConnector(BaseConnector[Any]):
         env: dict[str, str] | None = None,
     ) -> Dict[str, Any]:
         """Run a shell command string (used for conda-wrapped scripts)."""
-        exec_env = os.environ.copy()
-        if env:
-            exec_env.update(env)
+        # W13: use shared env sanitization instead of raw merge
+        exec_env = sanitize_env(env)
 
         cwd = working_dir or os.getcwd()
 
@@ -330,15 +303,10 @@ class LocalShellConnector(BaseConnector[Any]):
                 logger.error("SecurityPolicy blocked python code execution")
                 raise PermissionError("SecurityPolicy: python code execution blocked")
 
-        # Write code to temp file (same as local_server)
-        suffix = uuid.uuid4().hex
-        if platform_name == "Windows":
-            temp_filename = os.path.join(tempfile.gettempdir(), f"python_exec_{suffix}.py")
-        else:
-            temp_filename = f"/tmp/python_exec_{suffix}.py"
-
+        # W13: secure temp file with mkstemp (O_EXCL, restricted permissions)
+        fd, temp_filename = create_secure_temp_file(suffix=".py", prefix="openspace_py_")
         try:
-            with open(temp_filename, "w") as f:
+            with os.fdopen(fd, "w") as f:
                 f.write(_PYTHON_RLIMIT_PREAMBLE)
                 f.write(code)
 
@@ -407,18 +375,12 @@ class LocalShellConnector(BaseConnector[Any]):
         # Wrap with conda if needed
         final_script = _wrap_script_with_conda(script, conda_env)
 
-        # Write to temp file (same as local_server)
-        suffix = uuid.uuid4().hex
-        if platform_name == "Windows":
-            temp_filename = os.path.join(tempfile.gettempdir(), f"bash_exec_{suffix}.sh")
-        else:
-            temp_filename = f"/tmp/bash_exec_{suffix}.sh"
-
+        # W13: secure temp file with mkstemp (O_EXCL, restricted permissions)
+        fd, temp_filename = create_secure_temp_file(suffix=".sh", prefix="openspace_bash_")
         try:
-            with open(temp_filename, "w") as f:
+            with os.fdopen(fd, "w") as f:
                 f.write(_BASH_RLIMIT_PREAMBLE)
                 f.write(final_script)
-            os.chmod(temp_filename, 0o755)
 
             logger.info(
                 "Executing bash script locally with timeout=%d seconds%s%s%s",

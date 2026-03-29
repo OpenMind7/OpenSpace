@@ -116,6 +116,8 @@ _DANGEROUS_DUNDER_ATTRS: frozenset[str] = frozenset({
     "__builtins__",    # reach __import__ via builtins dict
     "__code__",        # bytecode manipulation → construct functions
     "__import__",      # dunder import as attribute access
+    # W12.2: builtins.__dict__["__import__"] bypass (Codex finding)
+    "__dict__",        # dict access → builtins.__dict__["__import__"] → arbitrary import
 })
 
 # S2: sys module dangerous attributes (checked via visit_Attribute)
@@ -251,6 +253,11 @@ class DangerousNodeVisitor(ast.NodeVisitor):
         if root in self._module_aliases:
             resolved = self._module_aliases[root]
             chain = f"{resolved}.{parts[1]}" if len(parts) > 1 else resolved
+        elif root in self._name_aliases:
+            # W12.2: Resolve from-import aliases (e.g., `from os import environ`)
+            # _name_aliases maps "environ" → "os.environ"
+            resolved = self._name_aliases[root]
+            chain = f"{resolved}.{parts[1]}" if len(parts) > 1 else resolved
 
         self._check_qualified_call(chain)
 
@@ -325,8 +332,16 @@ class DangerousNodeVisitor(ast.NodeVisitor):
 
         S8: Handles both ``getattr(os, ...)`` (ast.Name) and
         ``getattr(some.module, ...)`` (ast.Attribute).
+        W12.2: Also blocks getattr(ANY_object, dunder_attr) for sandbox escapes.
         """
         if len(node.args) < 2:
+            return
+
+        # W12.2: Block getattr(ANY_obj, dunder_attr) regardless of receiver type.
+        # Catches: getattr(object, "__subclasses__"), getattr(f, "__globals__"), etc.
+        attr_arg = _get_constant_arg(node, 1)
+        if attr_arg is not None and attr_arg in _DANGEROUS_DUNDER_ATTRS:
+            self.flags.append("blocked.shell_injection")
             return
 
         obj = node.args[0]
@@ -349,7 +364,6 @@ class DangerousNodeVisitor(ast.NodeVisitor):
             return
 
         if resolved_mod in _ALL_DANGEROUS_MODULES or resolved_mod == "os":
-            attr_arg = _get_constant_arg(node, 1)
             if attr_arg is None:
                 # Dynamic attr on dangerous module — fail-closed
                 flag = ("blocked.credential_exfil"
@@ -358,6 +372,12 @@ class DangerousNodeVisitor(ast.NodeVisitor):
                 self.flags.append(flag)
             elif resolved_mod == "os" and attr_arg in _DANGEROUS_OS_FUNCS:
                 self.flags.append("blocked.shell_injection")
+            elif resolved_mod == "os" and attr_arg == "getenv":
+                # W12.2: getattr(os, "getenv") — credential exfiltration
+                self.flags.append("blocked.credential_exfil")
+            elif resolved_mod == "os" and attr_arg == "environ":
+                # W12.2: getattr(os, "environ") — gateway to credentials
+                self.flags.append("blocked.credential_exfil")
             elif resolved_mod == "subprocess" and attr_arg in _DANGEROUS_SUBPROCESS_FUNCS:
                 self.flags.append("blocked.shell_injection")
 
@@ -385,25 +405,41 @@ class DangerousNodeVisitor(ast.NodeVisitor):
         """Detect os.environ[...] subscript access for credential exfiltration.
 
         Both constant sensitive keys and non-constant keys are flagged.
+        W12.2: Also handles aliased environ (from os import environ; environ["KEY"]).
         """
+        is_os_environ = False
+
         if isinstance(node.value, ast.Attribute) and node.value.attr == "environ":
             if isinstance(node.value.value, ast.Name):
                 obj_name = node.value.value.id
                 resolved = self._module_aliases.get(obj_name, obj_name)
                 if resolved == "os":
-                    # Check if the key is a sensitive constant
-                    key = None
-                    if isinstance(node.slice, ast.Constant) and isinstance(node.slice.value, str):
-                        key = node.slice.value
-                    if key is not None:
-                        key_upper = key.upper()
-                        sensitive_keywords = {"KEY", "TOKEN", "SECRET", "PASSWORD", "CREDENTIAL", "PRIVATE"}
-                        if any(kw in key_upper for kw in sensitive_keywords):
-                            self.flags.append("blocked.credential_exfil")
-                    else:
-                        # Non-constant key — fail-closed
-                        self.flags.append("blocked.credential_exfil")
+                    is_os_environ = True
+        elif isinstance(node.value, ast.Name):
+            # W12.2: from os import environ (as alias); environ["KEY"]
+            name = node.value.id
+            resolved = self._name_aliases.get(name, "")
+            if resolved == "os.environ":
+                is_os_environ = True
+
+        if is_os_environ:
+            self._check_environ_subscript_key(node)
+
         self.generic_visit(node)
+
+    def _check_environ_subscript_key(self, node: ast.Subscript) -> None:
+        """Check an os.environ[key] subscript for sensitive or dynamic keys."""
+        key = None
+        if isinstance(node.slice, ast.Constant) and isinstance(node.slice.value, str):
+            key = node.slice.value
+        if key is not None:
+            key_upper = key.upper()
+            sensitive_keywords = {"KEY", "TOKEN", "SECRET", "PASSWORD", "CREDENTIAL", "PRIVATE"}
+            if any(kw in key_upper for kw in sensitive_keywords):
+                self.flags.append("blocked.credential_exfil")
+        else:
+            # Non-constant key — fail-closed
+            self.flags.append("blocked.credential_exfil")
 
     # --- Main visit_Call (single entry point for all call analysis) ---
 

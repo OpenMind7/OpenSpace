@@ -5,19 +5,23 @@ import subprocess
 import signal
 import time
 import json
-import uuid
 from datetime import datetime
 from flask import Flask, request, jsonify, send_file, abort
 import pyautogui
 import threading
 from io import BytesIO
-import tempfile
 
 from openspace.utils.logging import Logger
 from openspace.local_server.utils import AccessibilityHelper, ScreenshotHelper
 from openspace.local_server.platform_adapters import get_platform_adapter
 from openspace.local_server.health_checker import HealthChecker
 from openspace.local_server.feature_checker import FeatureChecker
+from openspace.local_server.subprocess_safety import (
+    sanitize_env,
+    create_secure_temp_file,
+    BASH_RLIMIT_PREAMBLE,
+    PYTHON_RLIMIT_PREAMBLE,
+)
 
 platform_name = platform.system()
 
@@ -207,33 +211,34 @@ def execute_command():
                 command[i] = os.path.expanduser(arg)
     
     try:
+        run_kwargs = dict(
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            shell=shell,
+            text=True,
+            timeout=timeout,
+        )
         if platform_name == "Windows":
-            result = subprocess.run(
-                command,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                shell=shell,
-                text=True,
-                timeout=timeout,
-                creationflags=subprocess.CREATE_NO_WINDOW,
-            )
+            run_kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
         else:
-            result = subprocess.run(
-                command,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                shell=shell,
-                text=True,
-                timeout=timeout,
-            )
-        
+            run_kwargs["start_new_session"] = True  # W13: process group isolation
+
+        result = subprocess.run(command, **run_kwargs)
+
         return jsonify({
             'status': 'success',
             'output': result.stdout,
             'error': result.stderr,
             'returncode': result.returncode
         })
-    except subprocess.TimeoutExpired:
+    except subprocess.TimeoutExpired as exc:
+        # W13: kill entire process group on timeout (not just the leader)
+        if exc.cmd and platform_name != "Windows":
+            try:
+                # The child runs in its own session, so pgid == its pid
+                os.killpg(os.getpgid(os.getpid()), signal.SIGKILL)
+            except (ProcessLookupError, OSError, PermissionError):
+                pass
         return jsonify({
             'status': 'error',
             'message': f'Command timeout after {timeout} seconds'
@@ -254,38 +259,32 @@ def execute_command_with_verification():
     verification = data.get('verification', {})
     max_wait_time = data.get('max_wait_time', 10) # Maximum wait time in seconds
     check_interval = data.get('check_interval', 1) # Check interval in seconds
-    
+
     if isinstance(command, str) and not shell:
         command = shlex.split(command)
-    
+
     # Expand user directory
     if isinstance(command, list):
         for i, arg in enumerate(command):
             if arg.startswith("~/"):
                 command[i] = os.path.expanduser(arg)
-    
+
     # Execute the main command
     try:
+        run_kwargs = dict(
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            shell=shell,
+            text=True,
+            timeout=120,
+        )
         if platform_name == "Windows":
-            result = subprocess.run(
-                command,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                shell=shell,
-                text=True,
-                timeout=120,
-                creationflags=subprocess.CREATE_NO_WINDOW,
-            )
+            run_kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
         else:
-            result = subprocess.run(
-                command,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                shell=shell,
-                text=True,
-                timeout=120,
-            )
-        
+            run_kwargs["start_new_session"] = True  # W13: process group isolation
+
+        result = subprocess.run(command, **run_kwargs)
+
         # If no verification is needed, return immediately
         if not verification:
             return jsonify({
@@ -294,12 +293,12 @@ def execute_command_with_verification():
                 'error': result.stderr,
                 'returncode': result.returncode
             })
-        
+
         # Wait and verify the result
         start_time = time.time()
         while time.time() - start_time < max_wait_time:
             verification_passed = True
-            
+
             # Check window existence if specified
             if 'window_exists' in verification:
                 window_name = verification['window_exists']
@@ -309,7 +308,8 @@ def execute_command_with_verification():
                             ['wmctrl', '-l'],
                             capture_output=True,
                             text=True,
-                            check=True
+                            check=True,
+                            timeout=5
                         )
                         if window_name.lower() not in wmctrl_result.stdout.lower():
                             verification_passed = False
@@ -318,9 +318,10 @@ def execute_command_with_verification():
                         windows = platform_adapter.list_windows() if hasattr(platform_adapter, 'list_windows') else []
                         if not any(window_name.lower() in str(w).lower() for w in windows):
                             verification_passed = False
-                except:
+                except Exception as e:
+                    logger.warning("Window existence check failed: %s", e)
                     verification_passed = False
-            
+
             # Check command execution if specified
             if 'command_success' in verification:
                 verify_cmd = verification['command_success']
@@ -334,9 +335,10 @@ def execute_command_with_verification():
                     )
                     if verify_result.returncode != 0:
                         verification_passed = False
-                except:
+                except Exception as e:
+                    logger.warning("Verification command failed: %s", e)
                     verification_passed = False
-            
+
             if verification_passed:
                 return jsonify({
                     'status': 'success',
@@ -346,9 +348,9 @@ def execute_command_with_verification():
                     'verification': 'passed',
                     'wait_time': time.time() - start_time
                 })
-            
+
             time.sleep(check_interval)
-        
+
         # Verification failed
         return jsonify({
             'status': 'verification_failed',
@@ -358,7 +360,7 @@ def execute_command_with_verification():
             'verification': 'failed',
             'wait_time': max_wait_time
         }), 500
-        
+
     except Exception as e:
         return jsonify({
             'status': 'error',
@@ -422,98 +424,72 @@ def run_python():
     working_dir = data.get('working_dir', None)
     env = data.get('env', None)
     conda_env = data.get('conda_env', None)
-    
+
     if not code:
         return jsonify({'status': 'error', 'message': 'Code not supplied!'}), 400
-    
-    # Generate unique filename
-    if platform_name == "Windows":
-        temp_filename = os.path.join(tempfile.gettempdir(), f"python_exec_{uuid.uuid4().hex}.py")
-    else:
-        temp_filename = f"/tmp/python_exec_{uuid.uuid4().hex}.py"
-    
+
+    # W13: secure temp file + environment sanitization + resource limits
+    fd, temp_filename = create_secure_temp_file(suffix=".py", prefix="openspace_py_")
     try:
-        with open(temp_filename, 'w') as f:
+        with os.fdopen(fd, 'w') as f:
+            f.write(PYTHON_RLIMIT_PREAMBLE)
             f.write(code)
-        
-        # Prepare environment variables
-        exec_env = os.environ.copy()
-        if env:
-            exec_env.update(env)
-        
+
+        exec_env = sanitize_env(env)
+
+        # Common kwargs for subprocess.run
+        run_base = dict(
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=timeout,
+            cwd=working_dir or os.getcwd(),
+            env=exec_env,
+        )
+        if platform_name != "Windows":
+            run_base["start_new_session"] = True  # W13: process group isolation
+
         # If conda_env is specified, try to use bash/cmd to activate and run
-        # If conda is not available, fall back to system Python
         if conda_env:
             activation_cmd = get_conda_activation_prefix(conda_env)
-            # Check if conda activation command is empty (conda not found)
             if not activation_cmd:
-                logger.warning(f"Conda environment '{conda_env}' requested but conda not found. Using system Python.")
-                conda_env = None  # Disable conda and use default path
-        
+                logger.warning("Conda environment '%s' requested but conda not found. Using system Python.", conda_env)
+                conda_env = None
+
         if conda_env and get_conda_activation_prefix(conda_env):
             if platform_name == "Windows":
-                # Windows: use cmd with activation
                 activation_cmd = get_conda_activation_prefix(conda_env)
                 full_cmd = f'{activation_cmd}python "{temp_filename}"'
-                result = subprocess.run(
-                    ['cmd', '/c', full_cmd],
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE,
-                    text=True,
-                    timeout=timeout,
-                    cwd=working_dir or os.getcwd(),
-                    env=exec_env
-                )
+                result = subprocess.run(['cmd', '/c', full_cmd], **run_base)
             else:
-                # Linux/macOS: use bash with activation
                 activation_cmd = get_conda_activation_prefix(conda_env)
                 full_cmd = f'{activation_cmd}python3 "{temp_filename}"'
-                result = subprocess.run(
-                    ['/bin/bash', '-c', full_cmd],
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE,
-                    text=True,
-                    timeout=timeout,
-                    cwd=working_dir or os.getcwd(),
-                    env=exec_env
-                )
+                result = subprocess.run(['/bin/bash', '-c', full_cmd], **run_base)
         else:
-            # No conda activation needed
             python_cmd = 'python' if platform_name == "Windows" else 'python3'
-            result = subprocess.run(
-                [python_cmd, temp_filename],
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-                timeout=timeout,
-                cwd=working_dir or os.getcwd(),
-                env=exec_env
-            )
-        
-        os.remove(temp_filename)
-        
+            result = subprocess.run([python_cmd, temp_filename], **run_base)
+
         output = result.stdout + result.stderr
-        
+
         return jsonify({
             'status': 'success' if result.returncode == 0 else 'error',
             'content': output or "Code executed successfully (no output)",
             'returncode': result.returncode
         })
-        
+
     except subprocess.TimeoutExpired:
-        if os.path.exists(temp_filename):
-            os.remove(temp_filename)
         return jsonify({
             'status': 'error',
             'message': f'Execution timeout after {timeout} seconds'
         }), 408
     except Exception as e:
-        if os.path.exists(temp_filename):
-            os.remove(temp_filename)
         return jsonify({
             'status': 'error',
             'message': str(e)
         }), 500
+    finally:
+        if os.path.exists(temp_filename):
+            os.remove(temp_filename)
 
 @app.route("/run_bash_script", methods=['POST'])
 def run_bash_script():
@@ -523,57 +499,42 @@ def run_bash_script():
     working_dir = data.get('working_dir', None)
     env = data.get('env', None)
     conda_env = data.get('conda_env', None)
-    
+
     if not script:
         return jsonify({'status': 'error', 'message': 'Script not supplied!'}), 400
-    
-    # Generate unique filename
-    if platform_name == "Windows":
-        temp_filename = os.path.join(tempfile.gettempdir(), f"bash_exec_{uuid.uuid4().hex}.sh")
-    else:
-        temp_filename = f"/tmp/bash_exec_{uuid.uuid4().hex}.sh"
-    
+
+    # W13: secure temp file + environment sanitization + resource limits
+    fd, temp_filename = create_secure_temp_file(suffix=".sh", prefix="openspace_bash_")
     try:
-        # Wrap script with conda activation if needed
         final_script = wrap_script_with_conda(script, conda_env)
-        
-        with open(temp_filename, 'w') as f:
+        with os.fdopen(fd, 'w') as f:
+            f.write(BASH_RLIMIT_PREAMBLE)
             f.write(final_script)
-        
-        os.chmod(temp_filename, 0o755)
-        
-        if platform_name == "Windows":
-            shell_cmd = ['bash', temp_filename]
-        else:
-            shell_cmd = ['/bin/bash', temp_filename]
-        
-        # Prepare environment variables
-        exec_env = os.environ.copy()
-        if env:
-            exec_env.update(env)
-        
-        result = subprocess.run(
-            shell_cmd,
+
+        shell_cmd = ['bash', temp_filename] if platform_name == "Windows" else ['/bin/bash', temp_filename]
+        exec_env = sanitize_env(env)
+
+        run_kwargs = dict(
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             text=True,
             timeout=timeout,
             cwd=working_dir or os.getcwd(),
-            env=exec_env
+            env=exec_env,
         )
-        
-        os.unlink(temp_filename)
-        
+        if platform_name != "Windows":
+            run_kwargs["start_new_session"] = True  # W13: process group isolation
+
+        result = subprocess.run(shell_cmd, **run_kwargs)
+
         return jsonify({
             'status': 'success' if result.returncode == 0 else 'error',
             'output': result.stdout,
             'error': "",
             'returncode': result.returncode
         })
-        
+
     except subprocess.TimeoutExpired:
-        if os.path.exists(temp_filename):
-            os.unlink(temp_filename)
         return jsonify({
             'status': 'error',
             'output': f'Script execution timed out after {timeout} seconds',
@@ -581,17 +542,18 @@ def run_bash_script():
             'returncode': -1
         }), 500
     except Exception as e:
-        if os.path.exists(temp_filename):
-            try:
-                os.unlink(temp_filename)
-            except:
-                pass
         return jsonify({
             'status': 'error',
             'output': f'Failed to execute script: {str(e)}',
             'error': "",
             'returncode': -1
         }), 500
+    finally:
+        if os.path.exists(temp_filename):
+            try:
+                os.unlink(temp_filename)
+            except OSError as cleanup_err:
+                logger.warning("Failed to clean up temp file %s: %s", temp_filename, cleanup_err)
         
 @app.route('/screenshot', methods=['GET'])
 def capture_screen_with_cursor():
@@ -929,8 +891,8 @@ def end_recording():
             try:
                 recording_process.kill()
                 recording_process.wait()
-            except:
-                pass
+            except (ProcessLookupError, OSError) as kill_err:
+                logger.warning("Failed to kill recording process: %s", kill_err)
             recording_process = None
         return jsonify({
             'status': 'error',

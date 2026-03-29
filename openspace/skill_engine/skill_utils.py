@@ -23,7 +23,7 @@ SKILL_FILENAME = "SKILL.md"
 # File extensions scanned for safety violations in multi-file skills.
 # Executables, scripts, and markup that could contain injected payloads.
 _SCANNABLE_EXTENSIONS: frozenset = frozenset({
-    ".py", ".sh", ".bash", ".zsh", ".js", ".ts", ".md",
+    ".py", ".pyw", ".sh", ".bash", ".zsh", ".js", ".jsx", ".ts", ".tsx", ".md",
 })
 
 _SAFETY_RULES = [
