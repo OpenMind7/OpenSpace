@@ -75,6 +75,8 @@ _DANGEROUS_OS_FUNCS: frozenset[str] = frozenset({
     "execv", "execve", "execvp", "execvpe",
     "spawnl", "spawnle", "spawnlp", "spawnlpe",
     "spawnv", "spawnve", "spawnvp", "spawnvpe",
+    # W21: fork-bomb prevention (Codex Task 3 CRIT)
+    "fork", "forkpty",
 })
 
 # W12.1: os.environ method calls that access credentials
@@ -109,6 +111,14 @@ _BLANKET_BLOCKED_BUILTINS: frozenset[str] = frozenset({
     "breakpoint",  # S2: drops into interactive debugger → shell access
     # W12.1: globals()/locals() enable __import__ via dict subscription
     "globals", "locals", "vars",
+})
+
+# W21: Known-safe metaclasses that don't inject via __prepare__
+_SAFE_METACLASS_NAMES: frozenset[str] = frozenset({
+    "type",          # builtin default
+    "ABCMeta",       # abc.ABCMeta
+    "EnumMeta",      # enum.EnumMeta / enum.EnumType
+    "EnumType",      # Python 3.11+
 })
 
 # W12.1: Dangerous dunder attributes — sandbox escape via introspection
@@ -341,7 +351,14 @@ class DangerousNodeVisitor(ast.NodeVisitor):
         the class body for simple assignments and promote them so that
         ``C.run(...)`` or attribute access resolves correctly.
         Also handles metaclass ``__prepare__`` via type()-3-arg in _check_simple_call.
+
+        W21: Detects ``metaclass=X`` keyword where X is not a known-safe
+        metaclass.  Custom metaclasses can inject dangerous callables into
+        the class namespace via ``__prepare__``.
         """
+        # W21: Check metaclass= keyword for unknown/dangerous metaclasses
+        self._check_metaclass_keyword(node)
+
         class_name = node.name
         for stmt in node.body:
             if isinstance(stmt, ast.Assign):
@@ -361,6 +378,38 @@ class DangerousNodeVisitor(ast.NodeVisitor):
                         self._name_aliases[qual] = resolved
                         self._class_attr_taint[qual] = resolved
         self.generic_visit(node)
+
+    def _check_metaclass_keyword(self, node: ast.ClassDef) -> None:
+        """W21: Flag classes with unknown metaclass= that could inject via __prepare__.
+
+        Known-safe metaclasses (type, ABCMeta, EnumMeta) are allowed.
+        Unknown metaclasses are flagged because ``__prepare__`` can return a
+        custom namespace dict pre-populated with dangerous callables.
+        """
+        for kw in node.keywords:
+            if kw.arg != "metaclass":
+                continue
+            mc = kw.value
+            # Direct Name: metaclass=type, metaclass=ABCMeta
+            if isinstance(mc, ast.Name):
+                if mc.id in _SAFE_METACLASS_NAMES:
+                    return  # safe
+                # Check if it's an alias for a safe metaclass
+                resolved = self._name_aliases.get(mc.id) or self._module_aliases.get(mc.id)
+                if resolved and resolved.split(".")[-1] in _SAFE_METACLASS_NAMES:
+                    return  # e.g., abc.ABCMeta aliased
+                # Unknown metaclass — flag conservatively
+                self.flags.append("blocked.shell_injection")
+                return
+            # Attribute: metaclass=abc.ABCMeta
+            if isinstance(mc, ast.Attribute):
+                if mc.attr in _SAFE_METACLASS_NAMES:
+                    return  # safe
+                self.flags.append("blocked.shell_injection")
+                return
+            # Any other expression (call, subscript, etc.) — fail-closed
+            self.flags.append("blocked.shell_injection")
+            return
 
     # --- W20 C2: Comprehension taint tracking ---
 

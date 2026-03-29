@@ -195,6 +195,7 @@ ulimit -t 300 2>/dev/null || echo "[openspace:rlimit] WARN: CPU time limit not e
 ulimit -v 2097152 2>/dev/null || echo "[openspace:rlimit] WARN: virtual memory limit not enforced" >&2
 ulimit -f 512000 2>/dev/null || echo "[openspace:rlimit] WARN: file size limit not enforced" >&2
 ulimit -n 1024 2>/dev/null || echo "[openspace:rlimit] WARN: file descriptor limit not enforced" >&2
+ulimit -u 64 2>/dev/null || echo "[openspace:rlimit] WARN: max process limit not enforced" >&2
 # --- end resource limits ---
 """
 
@@ -211,12 +212,17 @@ for _res, _lim in [
         _os_rlimit.setrlimit(_res, _lim)
     except (ValueError, OSError) as _os_e:
         print(f"[openspace:rlimit] WARN: setrlimit({_res}) failed: {_os_e}", file=_os_sys.stderr)
-# RLIMIT_AS is unsupported on macOS — only set on Linux
+# RLIMIT_AS and RLIMIT_NPROC are unsupported on macOS — only set on Linux
 if _os_sys.platform == "linux":
-    try:
-        _os_rlimit.setrlimit(_os_rlimit.RLIMIT_AS, (2 * 1024**3, 2 * 1024**3))
-    except (ValueError, OSError) as _os_e:
-        print(f"[openspace:rlimit] WARN: setrlimit(RLIMIT_AS) failed: {_os_e}", file=_os_sys.stderr)
+    for _res, _lim, _name in [
+        (_os_rlimit.RLIMIT_AS, (2 * 1024**3, 2 * 1024**3), "RLIMIT_AS"),
+        (_os_rlimit.RLIMIT_NPROC, (64, 64), "RLIMIT_NPROC"),
+    ]:
+        try:
+            _os_rlimit.setrlimit(_res, _lim)
+        except (ValueError, OSError) as _os_e:
+            print(f"[openspace:rlimit] WARN: setrlimit({_name}) failed: {_os_e}", file=_os_sys.stderr)
+    del _name
 del _os_rlimit, _os_sys, _res, _lim
 # --- end resource limits ---
 """

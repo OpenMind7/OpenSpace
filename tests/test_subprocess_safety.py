@@ -471,3 +471,72 @@ class TestRlimitTelemetry:
         """Preamble must still delete temp names after telemetry additions."""
         assert "del _os_rlimit" in PYTHON_RLIMIT_PREAMBLE
         assert "del" in PYTHON_RLIMIT_PREAMBLE
+
+
+# ---------------------------------------------------------------------------
+# W21: RLIMIT_NPROC — fork bomb prevention
+# ---------------------------------------------------------------------------
+
+class TestRlimitNproc:
+    """W21: RLIMIT_NPROC must be set to prevent fork bombs via
+    multiprocessing.Process or os.fork() in loops."""
+
+    def test_python_preamble_has_nproc(self):
+        """Python preamble must include RLIMIT_NPROC."""
+        assert "RLIMIT_NPROC" in PYTHON_RLIMIT_PREAMBLE
+
+    def test_python_preamble_nproc_linux_only(self):
+        """RLIMIT_NPROC is Linux-only (not available on macOS)."""
+        # The setrlimit call for NPROC must be inside a platform == "linux" guard
+        assert 'platform == "linux"' in PYTHON_RLIMIT_PREAMBLE
+        # RLIMIT_NPROC setrlimit must come AFTER the linux check
+        linux_idx = PYTHON_RLIMIT_PREAMBLE.index('platform == "linux"')
+        after_linux = PYTHON_RLIMIT_PREAMBLE[linux_idx:]
+        assert "RLIMIT_NPROC" in after_linux, "RLIMIT_NPROC setrlimit must be inside Linux guard"
+
+    def test_python_preamble_nproc_has_warning(self):
+        """RLIMIT_NPROC failure must emit a warning, not silently pass."""
+        lines = PYTHON_RLIMIT_PREAMBLE.split("\n")
+        found_nproc = False
+        for line in lines:
+            if "RLIMIT_NPROC" in line:
+                found_nproc = True
+            if found_nproc and "WARN" in line and "NPROC" in line:
+                break
+        else:
+            if found_nproc:
+                # Check broader pattern — warning might reference "setrlimit" generically
+                nproc_section = PYTHON_RLIMIT_PREAMBLE[
+                    PYTHON_RLIMIT_PREAMBLE.index("RLIMIT_NPROC"):
+                ]
+                assert "WARN" in nproc_section or "setrlimit" in nproc_section
+
+    def test_python_preamble_nproc_reasonable_limit(self):
+        """RLIMIT_NPROC limit should be reasonable (32-128 processes)."""
+        import re
+        # Find the NPROC limit value — look for (N, N) tuple after RLIMIT_NPROC
+        match = re.search(r"RLIMIT_NPROC,\s*\((\d+),\s*(\d+)\)", PYTHON_RLIMIT_PREAMBLE)
+        assert match, "Could not find RLIMIT_NPROC limit value"
+        soft, hard = int(match.group(1)), int(match.group(2))
+        assert 32 <= soft <= 128, f"RLIMIT_NPROC soft={soft} outside reasonable range [32, 128]"
+        assert soft == hard, "RLIMIT_NPROC soft and hard limits should match"
+
+    def test_bash_preamble_has_nproc(self):
+        """Bash preamble must include ulimit -u (max user processes)."""
+        assert "ulimit -u" in BASH_RLIMIT_PREAMBLE
+
+    def test_bash_preamble_nproc_has_warning(self):
+        """Bash nproc limit must have a failure warning."""
+        lines = BASH_RLIMIT_PREAMBLE.split("\n")
+        for line in lines:
+            if "ulimit -u" in line:
+                assert "WARN" in line or "process" in line.lower(), (
+                    f"ulimit -u line missing failure warning: {line}"
+                )
+                break
+        else:
+            pytest.fail("ulimit -u not found in bash preamble")
+
+    def test_python_preamble_still_compiles_with_nproc(self):
+        """Preamble must still be valid Python after NPROC addition."""
+        compile(PYTHON_RLIMIT_PREAMBLE, "<preamble>", "exec")

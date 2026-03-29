@@ -596,17 +596,30 @@ CAPABILITY_TO_BACKENDS: Dict[str, frozenset[str]] = {
 _SHELL_REQUIRING_CAPABILITIES = frozenset({"filesystem", "subprocess", "env_vars", "gpu"})
 
 
-def capabilities_need_shell(capabilities: frozenset[str]) -> bool:
+def capabilities_need_shell(
+    capabilities: frozenset[str],
+    *,
+    strict: bool = False,
+) -> bool:
     """Return True if *capabilities* require the shell backend.
 
-    Fail-open: empty capabilities (legacy skills) return True so that
-    existing skills continue to work.  Only explicit network-only or
+    Fail-open (default): empty capabilities (legacy skills) return True so
+    that existing skills continue to work.  Only explicit network-only or
     cloud_api-only skills skip shell auto-add.
+
+    W21: When *strict=True*, empty capabilities return False (deny shell
+    access).  Use strict mode for new skills that MUST declare capabilities.
     """
     if not capabilities:
+        if strict:
+            logger.warning(
+                "capabilities_need_shell: empty capability set — strict mode "
+                "DENIES shell access. Skill must declare capabilities.",
+            )
+            return False
         logger.warning(
-            "capabilities_need_shell: empty capability set — fail-open to True "
-            "(legacy skill without manifest). Consider adding capability declarations.",
+            "capabilities_need_shell: empty capability set — legacy fail-open "
+            "to True (DEPRECATED). Add capability declarations to this skill.",
         )
         return True  # legacy / no manifest → fail-open
     return bool(capabilities & _SHELL_REQUIRING_CAPABILITIES)
@@ -614,13 +627,20 @@ def capabilities_need_shell(capabilities: frozenset[str]) -> bool:
 
 def allowed_backends_for_capabilities(
     capabilities: frozenset[str],
+    *,
+    strict: bool = False,
 ) -> Optional[frozenset[str]]:
     """Return the set of backend names a skill may use, or None (allow all).
 
     Returns None when *capabilities* is empty (legacy fail-open) so callers
     can skip filtering entirely for backward compatibility.
+
+    W21: When *strict=True*, empty capabilities return an empty frozenset
+    (deny all non-system backends) instead of None.
     """
     if not capabilities:
+        if strict:
+            return frozenset({"system"})  # only internal tools allowed
         return None  # legacy — no restriction
     backends: set[str] = set()
     for cap in capabilities:
@@ -635,13 +655,17 @@ def allowed_backends_for_capabilities(
 def filter_tools_by_capabilities(
     tools: list,
     capabilities: frozenset[str],
+    *,
+    strict: bool = False,
 ) -> list:
     """Remove tools whose backend is not permitted by *capabilities*.
 
     Legacy skills (empty capabilities) pass all tools through unchanged.
     Tools with backend_type NOT_SET or SYSTEM always pass.
+
+    W21: When *strict=True*, empty capabilities restrict to system-only tools.
     """
-    allowed = allowed_backends_for_capabilities(capabilities)
+    allowed = allowed_backends_for_capabilities(capabilities, strict=strict)
     if allowed is None:
         return tools  # legacy — no filtering
 

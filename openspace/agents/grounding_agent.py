@@ -128,30 +128,36 @@ class GroundingAgent(BaseAgent):
 
     @classmethod
     def _cap_message_content(cls, messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-        """Truncate oversized individual message contents in-place.
+        """Return a new list with oversized message contents truncated.
 
+        W21: Creates new message dicts instead of mutating originals.
         Targets tool-result messages and assistant messages that can
         carry enormous file contents (read_file on large CSVs/scripts).
         System messages and the first user instruction are never touched.
         """
         cap = cls._MAX_SINGLE_CONTENT_CHARS
         trimmed = 0
+        result: List[Dict[str, Any]] = []
         for msg in messages:
             content = msg.get("content")
-            if not isinstance(content, str) or len(content) <= cap:
-                continue
-            if msg.get("role") == "system":
-                continue
-            original_len = len(content)
-            msg["content"] = (
-                content[: cap // 2]
-                + f"\n\n... [truncated {original_len - cap:,} chars] ...\n\n"
-                + content[-(cap // 2):]
-            )
-            trimmed += 1
+            if (
+                isinstance(content, str)
+                and len(content) > cap
+                and msg.get("role") != "system"
+            ):
+                original_len = len(content)
+                capped_content = (
+                    content[: cap // 2]
+                    + f"\n\n... [truncated {original_len - cap:,} chars] ...\n\n"
+                    + content[-(cap // 2):]
+                )
+                result.append({**msg, "content": capped_content})
+                trimmed += 1
+            else:
+                result.append(msg)
         if trimmed:
             logger.info(f"Capped {trimmed} oversized message(s) to {cap:,} chars each")
-        return messages
+        return result
 
     def _truncate_messages(
         self, 

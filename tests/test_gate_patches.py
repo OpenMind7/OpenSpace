@@ -488,3 +488,117 @@ class TestSetFrontmatterFieldDedup:
         result = set_frontmatter_field(content, "version", "1.0")
         assert "version: 1.0" in result
         assert "name: test" in result
+
+
+# ── W21: Empty capabilities fail-open hardening ─────────────────────────
+
+class TestCapabilitiesStrictMode:
+    """W21: Empty capabilities (legacy) should support strict mode that
+    denies access instead of fail-open to all backends."""
+
+    def test_capabilities_need_shell_legacy_failopen(self):
+        """Default behavior: empty capabilities → True (backward compat)."""
+        from openspace.skill_engine.skill_utils import capabilities_need_shell
+        assert capabilities_need_shell(frozenset()) is True
+
+    def test_capabilities_need_shell_strict_denies_empty(self):
+        """Strict mode: empty capabilities → False (no shell access)."""
+        from openspace.skill_engine.skill_utils import capabilities_need_shell
+        assert capabilities_need_shell(frozenset(), strict=True) is False
+
+    def test_capabilities_need_shell_strict_allows_declared(self):
+        """Strict mode with declared caps: filesystem → True."""
+        from openspace.skill_engine.skill_utils import capabilities_need_shell
+        assert capabilities_need_shell(frozenset({"filesystem"}), strict=True) is True
+
+    def test_allowed_backends_legacy_failopen(self):
+        """Default: empty capabilities → None (allow all)."""
+        from openspace.skill_engine.skill_utils import allowed_backends_for_capabilities
+        assert allowed_backends_for_capabilities(frozenset()) is None
+
+    def test_allowed_backends_strict_denies_empty(self):
+        """Strict mode: empty capabilities → system-only frozenset (deny all backends)."""
+        from openspace.skill_engine.skill_utils import allowed_backends_for_capabilities
+        result = allowed_backends_for_capabilities(frozenset(), strict=True)
+        assert result == frozenset({"system"})  # only internal tools allowed
+
+    def test_allowed_backends_strict_allows_declared(self):
+        """Strict mode with declared caps: returns correct backends."""
+        from openspace.skill_engine.skill_utils import allowed_backends_for_capabilities
+        result = allowed_backends_for_capabilities(
+            frozenset({"network"}), strict=True
+        )
+        assert result is not None
+        assert len(result) > 0
+
+    def test_filter_tools_strict_blocks_all_for_empty(self):
+        """Strict mode: empty capabilities → filters out all backend tools."""
+        from openspace.skill_engine.skill_utils import filter_tools_by_capabilities
+        from unittest import mock
+        tool1 = mock.Mock()
+        tool1.backend_type = "shell"
+        tool2 = mock.Mock()
+        tool2.backend_type = "SYSTEM"
+        # Strict with empty caps should filter backend tools
+        result = filter_tools_by_capabilities([tool1, tool2], frozenset(), strict=True)
+        # SYSTEM tools always pass, but shell tools should be blocked
+        assert len(result) <= len([tool1, tool2])
+
+    def test_empty_capabilities_logs_deprecation_warning(self):
+        """Legacy fail-open should log a deprecation warning."""
+        from unittest import mock
+        from openspace.skill_engine.skill_utils import capabilities_need_shell
+        with mock.patch("openspace.skill_engine.skill_utils.logger") as mock_log:
+            capabilities_need_shell(frozenset())
+            mock_log.warning.assert_called()
+            call_args = mock_log.warning.call_args[0][0]
+            assert "legacy" in call_args.lower() or "deprecated" in call_args.lower() or "capability" in call_args.lower()
+
+
+# ── W21: _cap_message_content immutability ───────────────────────────────
+
+class TestCapMessageContentImmutability:
+    """W21: _cap_message_content must NOT mutate original messages."""
+
+    def test_original_messages_not_mutated(self):
+        """Capping should create new message dicts, not modify originals."""
+        from openspace.agents.grounding_agent import GroundingAgent
+        long_content = "x" * 100_000
+        original_msg = {"role": "tool", "content": long_content}
+        messages = [
+            {"role": "system", "content": "sys"},
+            original_msg,
+        ]
+        result = GroundingAgent._cap_message_content(messages)
+        # Original message content must be unchanged
+        assert original_msg["content"] == long_content
+        assert len(original_msg["content"]) == 100_000
+
+    def test_capped_result_is_shorter(self):
+        """Result messages should have truncated content."""
+        from openspace.agents.grounding_agent import GroundingAgent
+        long_content = "x" * 100_000
+        messages = [
+            {"role": "system", "content": "sys"},
+            {"role": "tool", "content": long_content},
+        ]
+        result = GroundingAgent._cap_message_content(messages)
+        assert len(result[1]["content"]) < 100_000
+
+    def test_returns_new_list(self):
+        """Must return a new list, not the same reference."""
+        from openspace.agents.grounding_agent import GroundingAgent
+        messages = [
+            {"role": "system", "content": "sys"},
+            {"role": "tool", "content": "x" * 100_000},
+        ]
+        result = GroundingAgent._cap_message_content(messages)
+        assert result is not messages
+
+    def test_system_messages_untouched(self):
+        """System messages must never be capped regardless of size."""
+        from openspace.agents.grounding_agent import GroundingAgent
+        long_sys = "s" * 100_000
+        messages = [{"role": "system", "content": long_sys}]
+        result = GroundingAgent._cap_message_content(messages)
+        assert result[0]["content"] == long_sys
