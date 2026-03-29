@@ -834,20 +834,134 @@ class TestAdversarialW12:
         assert not any(f.startswith("blocked.") for f in flags)
 
     def test_assign_rebind_clears_taint(self) -> None:
-        """W15.3: x = os.environ; x = 42 — rebind kills taint."""
+        """W15.3→W16: x = os.environ; x = 42 — rebind clears taint.
+        W16 LOW fix: stale taint is now properly cleared on rebind.
+        """
         src = "import os\nx = os.environ\nx = 42\nx.get('KEY')"
         flags = check_ast_safety(src)
-        # After x = 42, x no longer resolves to os.environ.
-        # 42 is ast.Constant, _resolve_rhs returns None, so x is removed from _name_aliases?
-        # Actually, x=42 means _propagate_taint(x, Constant(42)) → resolved=None → no update.
-        # But the old entry _name_aliases["x"] = "os.environ" persists!
-        # This is a known conservative over-taint — acceptable for security.
-        # We flag it but document that it's a false positive in edge cases.
-        # For this test: x.get('KEY') with x still tainted → flagged
-        assert "blocked.credential_exfil" in flags
+        # W16: x = 42 clears the os.environ alias — x is no longer tainted
+        assert "blocked.credential_exfil" not in flags
 
     def test_annotated_assign_taint(self) -> None:
         """W15.3: env: Any = os.environ — annotated assignment propagates taint."""
         src = "import os\nfrom typing import Any\nenv: Any = os.environ\nenv.get('SECRET')"
         flags = check_ast_safety(src)
         assert "blocked.credential_exfil" in flags
+
+
+# ---------------------------------------------------------------------------
+# W16: Codex-found bypass fixes — 2 CRIT + 4 HIGH + 2 LOW
+# ---------------------------------------------------------------------------
+
+
+class TestW16CritBuiltinRebinding:
+    """W16 CRIT-1: Dangerous builtin rebinding must propagate taint."""
+
+    def test_globals_alias_import(self) -> None:
+        src = "g = globals\ng()['__import__']('os')"
+        assert "blocked.shell_injection" in check_ast_safety(src)
+
+    def test_eval_alias(self) -> None:
+        src = "e = eval\ne('1+1')"
+        assert "blocked.shell_injection" in check_ast_safety(src)
+
+    def test_exec_alias(self) -> None:
+        src = "x = exec\nx('print(1)')"
+        assert "blocked.shell_injection" in check_ast_safety(src)
+
+    def test_builtins_alias_subscript(self) -> None:
+        src = "b = __builtins__\nb['__import__']('os')"
+        assert "blocked.shell_injection" in check_ast_safety(src)
+
+    def test_builtins_alias_get(self) -> None:
+        src = "b = __builtins__\nb.get('__import__')('os')"
+        assert "blocked.shell_injection" in check_ast_safety(src)
+
+
+class TestW16CritChainedDestructuring:
+    """W16 CRIT-2: Chained and destructuring assignment must propagate taint."""
+
+    def test_chained_assignment(self) -> None:
+        src = "import subprocess\na = b = subprocess\nb.run(['ls'])"
+        assert "blocked.shell_injection" in check_ast_safety(src)
+
+    def test_destructuring_tuple(self) -> None:
+        src = "import os\n(env,) = (os.environ,)\nenv.get('PASSWORD')"
+        assert "blocked.credential_exfil" in check_ast_safety(src)
+
+    def test_destructuring_list(self) -> None:
+        src = "import os\n[env] = [os.environ]\nenv.get('PASSWORD')"
+        assert "blocked.credential_exfil" in check_ast_safety(src)
+
+    def test_chained_both_tainted(self) -> None:
+        src = "import subprocess\na = b = subprocess\na.Popen(['ls'])"
+        assert "blocked.shell_injection" in check_ast_safety(src)
+
+    def test_multi_destructure(self) -> None:
+        src = "import os, subprocess\nenv, sp = os.environ, subprocess\nsp.run(['ls'])"
+        assert "blocked.shell_injection" in check_ast_safety(src)
+
+
+class TestW16HighDynamicDunder:
+    """W16 HIGH-3: Dynamic dunder names in getattr via constant propagation."""
+
+    def test_variable_dunder_getattr(self) -> None:
+        src = 'a = "__globals__"\ngetattr(lambda: None, a)'
+        assert "blocked.shell_injection" in check_ast_safety(src)
+
+    def test_variable_subclasses_getattr(self) -> None:
+        src = 'a = "__subclasses__"\ngetattr(object, a)()'
+        assert "blocked.shell_injection" in check_ast_safety(src)
+
+
+class TestW16HighNonAssignmentTaint:
+    """W16 HIGH-4: Taint via for-loop, with, default args."""
+
+    def test_for_loop_environ(self) -> None:
+        src = "import os\nfor env in [os.environ]:\n    env.get('PASSWORD')"
+        assert "blocked.credential_exfil" in check_ast_safety(src)
+
+    def test_default_arg_environ(self) -> None:
+        src = "import os\ndef f(env=os.environ):\n    env.get('PASSWORD')"
+        assert "blocked.credential_exfil" in check_ast_safety(src)
+
+    def test_with_statement(self) -> None:
+        src = "import subprocess\nwith subprocess.Popen(['ls']) as p:\n    pass"
+        assert "blocked.shell_injection" in check_ast_safety(src)
+
+
+class TestW16HighResolveRhsWrappers:
+    """W16 HIGH-5: _resolve_rhs handles BoolOp/IfExp wrappers."""
+
+    def test_or_wrapper(self) -> None:
+        src = "import os\nbase = os.environ\nenv = base or {}\nenv.get('PASSWORD')"
+        assert "blocked.credential_exfil" in check_ast_safety(src)
+
+    def test_ifexp_wrapper(self) -> None:
+        src = "import os\nenv = os.environ if True else {}\nenv.get('PASSWORD')"
+        assert "blocked.credential_exfil" in check_ast_safety(src)
+
+    def test_named_expr_wrapper(self) -> None:
+        src = "import os\ny = (x := os.environ)\ny.get('PASSWORD')"
+        assert "blocked.credential_exfil" in check_ast_safety(src)
+
+
+class TestW16HighWrappedEnviron:
+    """W16 HIGH-6: Wrapped os.environ method calls detected."""
+
+    def test_lambda_wrapper_pop(self) -> None:
+        src = 'import os\n(lambda x: x)(os.environ).pop("PASSWORD")'
+        assert "blocked.credential_exfil" in check_ast_safety(src)
+
+    def test_walrus_wrapper_copy(self) -> None:
+        src = "import os\n(env := os.environ).copy()"
+        assert "blocked.credential_exfil" in check_ast_safety(src)
+
+
+class TestW16LowStaleTaintRebind:
+    """W16 LOW: Rebinding to safe value clears stale taint."""
+
+    def test_rebind_clears_taint(self) -> None:
+        src = "import os\nx = os.environ\nx = 42\nx.get('KEY')"
+        flags = check_ast_safety(src)
+        assert "blocked.credential_exfil" not in flags

@@ -209,42 +209,141 @@ class DangerousNodeVisitor(ast.NodeVisitor):
             self._name_aliases[local_name] = f"{mod_name}.{alias.name}"
         self.generic_visit(node)
 
-    # --- W15.3: Assignment-based taint propagation ---
+    # --- W15.3/W16: Assignment-based taint propagation ---
 
     def visit_Assign(self, node: ast.Assign) -> None:
         """Track assignment-based alias propagation.
 
-        Catches patterns like:
-          x = os.environ  → taint x as os.environ
-          run = subprocess.run  → taint run as subprocess.run
-          sp = subprocess  → taint sp as subprocess (module alias)
-
-        Kill-on-rebind: reassignment naturally overwrites the old entry.
+        W16 CRIT-2: Handles chained assignment (a = b = subprocess) by
+        iterating ALL targets, and destructuring ((a, b) = ...) by recursing
+        into Tuple/List/Starred leaves.
         """
-        if len(node.targets) == 1 and isinstance(node.targets[0], ast.Name):
-            self._propagate_taint(node.targets[0].id, node.value)
+        for target in node.targets:
+            self._propagate_taint_target(target, node.value)
         self.generic_visit(node)
 
     def visit_AnnAssign(self, node: ast.AnnAssign) -> None:
         """Track annotated assignment taint: ``x: Any = os.environ``."""
-        if node.value and isinstance(node.target, ast.Name):
-            self._propagate_taint(node.target.id, node.value)
+        if node.value:
+            self._propagate_taint_target(node.target, node.value)
         self.generic_visit(node)
 
     def visit_NamedExpr(self, node: ast.NamedExpr) -> None:
         """Track walrus operator taint: ``(x := os.environ)``."""
-        if isinstance(node.target, ast.Name):
-            self._propagate_taint(node.target.id, node.value)
+        self._propagate_taint_target(node.target, node.value)
         self.generic_visit(node)
+
+    # W16 HIGH-4: Non-assignment taint bindings
+
+    def visit_For(self, node: ast.For) -> None:
+        """Track for-loop taint: ``for env in [os.environ]: ...``
+
+        If the iter is a list/tuple/set literal with ONE element, propagate.
+        """
+        if isinstance(node.iter, (ast.List, ast.Tuple, ast.Set)):
+            elts = node.iter.elts
+            if len(elts) == 1:
+                self._propagate_taint_target(node.target, elts[0])
+        self.generic_visit(node)
+
+    def visit_AsyncFor(self, node: ast.AsyncFor) -> None:
+        """Same as visit_For for async for loops."""
+        if isinstance(node.iter, (ast.List, ast.Tuple, ast.Set)):
+            elts = node.iter.elts
+            if len(elts) == 1:
+                self._propagate_taint_target(node.target, elts[0])
+        self.generic_visit(node)
+
+    def visit_With(self, node: ast.With) -> None:
+        """Track with-statement taint: ``with open(...) as f: ...``"""
+        for item in node.items:
+            if item.optional_vars is not None:
+                self._propagate_taint_target(item.optional_vars, item.context_expr)
+        self.generic_visit(node)
+
+    def visit_AsyncWith(self, node: ast.AsyncWith) -> None:
+        """Same as visit_With for async with."""
+        for item in node.items:
+            if item.optional_vars is not None:
+                self._propagate_taint_target(item.optional_vars, item.context_expr)
+        self.generic_visit(node)
+
+    def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
+        """Track dangerous default arguments: ``def f(env=os.environ): ...``"""
+        self._propagate_default_args(node)
+        self.generic_visit(node)
+
+    def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef) -> None:
+        """Same as visit_FunctionDef for async functions."""
+        self._propagate_default_args(node)
+        self.generic_visit(node)
+
+    def _propagate_default_args(
+        self, node: ast.FunctionDef | ast.AsyncFunctionDef
+    ) -> None:
+        """Taint function parameters whose defaults resolve to dangerous values."""
+        args = node.args
+        # Regular args — defaults align right-to-left with args
+        n_defaults = len(args.defaults)
+        if n_defaults:
+            defaulted_args = args.args[-n_defaults:]
+            for arg, default in zip(defaulted_args, args.defaults):
+                self._propagate_taint(arg.arg, default)
+        # kw-only defaults
+        for arg, default in zip(args.kwonlyargs, args.kw_defaults):
+            if default is not None:
+                self._propagate_taint(arg.arg, default)
+
+    def _propagate_taint_target(
+        self, target: ast.expr, value: ast.expr
+    ) -> None:
+        """Recursively propagate taint through target patterns.
+
+        W16 CRIT-2: Handles:
+          - ast.Name: direct binding
+          - ast.Tuple/ast.List: destructuring (each element gets the value)
+          - ast.Starred: starred assignment
+        """
+        if isinstance(target, ast.Name):
+            self._propagate_taint(target.id, value)
+        elif isinstance(target, (ast.Tuple, ast.List)):
+            # For destructuring, propagate to each element.
+            # If value is also a tuple/list literal of matching length,
+            # propagate element-wise.
+            if isinstance(value, (ast.Tuple, ast.List)) and len(value.elts) == len(
+                target.elts
+            ):
+                for t, v in zip(target.elts, value.elts):
+                    self._propagate_taint_target(t, v)
+            else:
+                # Can't decompose value — propagate full value to each name leaf
+                for elt in target.elts:
+                    self._propagate_taint_target(elt, value)
+        elif isinstance(target, ast.Starred):
+            self._propagate_taint_target(target.value, value)
 
     def _propagate_taint(self, target_name: str, value: ast.expr) -> None:
         """Resolve *value* and record *target_name* as an alias.
 
         If value resolves to a module name → ``_module_aliases``.
         If value resolves to a qualified path → ``_name_aliases``.
+        If value is a string constant → ``_name_aliases`` (for getattr
+        constant propagation in W16 HIGH-3).
         If value cannot be resolved → no taint (conservative, not fail-closed
         on assignment — we only fail-closed at USE sites).
+
+        W16: Also clears stale aliases on rebind before resolving new RHS.
         """
+        # W16 LOW: clear stale taint before re-resolving
+        self._module_aliases.pop(target_name, None)
+        self._name_aliases.pop(target_name, None)
+
+        # W16 HIGH-3: string constant assignment (a = "__globals__")
+        # Store in _name_aliases so _check_getattr can resolve it.
+        if isinstance(value, ast.Constant) and isinstance(value.value, str):
+            self._name_aliases[target_name] = value.value
+            return
+
         resolved = self._resolve_rhs(value)
         if resolved is None:
             return
@@ -263,8 +362,11 @@ class DangerousNodeVisitor(ast.NodeVisitor):
     def _resolve_rhs(self, node: ast.expr) -> Optional[str]:
         """Resolve an expression to a qualified name string.
 
-        Returns None if the expression cannot be statically resolved
-        (e.g., function calls, arithmetic, comprehensions).
+        W16 CRIT-1: Also resolves dangerous builtins (eval, exec, globals,
+        vars, __import__, __builtins__) as taintable names.
+
+        W16 HIGH-5: Recurses through identity-preserving wrappers:
+        BoolOp (or/and), IfExp, NamedExpr.
         """
         if isinstance(node, ast.Name):
             name = node.id
@@ -272,6 +374,13 @@ class DangerousNodeVisitor(ast.NodeVisitor):
                 return self._module_aliases[name]
             if name in self._name_aliases:
                 return self._name_aliases[name]
+            # W16 CRIT-1: dangerous builtins are taintable
+            if name in _BLANKET_BLOCKED_BUILTINS:
+                return f"builtins.{name}"
+            if name == "__import__":
+                return "builtins.__import__"
+            if name == "__builtins__":
+                return "__builtins__"
             return None
 
         if isinstance(node, ast.Attribute):
@@ -287,6 +396,48 @@ class DangerousNodeVisitor(ast.NodeVisitor):
                 resolved = self._name_aliases[root]
                 return f"{resolved}.{parts[1]}" if len(parts) > 1 else resolved
             return chain
+
+        # W16 HIGH-5: identity-preserving wrappers — resolve through them
+        if isinstance(node, ast.BoolOp):
+            # `x or {}` / `x and y` — try each value, return first resolved
+            for val in node.values:
+                r = self._resolve_rhs(val)
+                if r is not None:
+                    return r
+            return None
+
+        if isinstance(node, ast.IfExp):
+            # `x if cond else y` — try body then orelse
+            return self._resolve_rhs(node.body) or self._resolve_rhs(node.orelse)
+
+        if isinstance(node, ast.NamedExpr):
+            # `(x := dangerous)` — resolve the value
+            return self._resolve_rhs(node.value)
+
+        return None
+
+    def _peel_to_resolve(self, node: ast.expr) -> Optional[str]:
+        """Recursively peel wrapper expressions to resolve a qualified name.
+
+        W16 HIGH-6: Handles identity-preserving wrappers that break
+        _resolve_attr_chain but preserve the object at runtime:
+          - Call: ``(lambda x: x)(os.environ)`` → resolve arg
+          - NamedExpr: ``(x := os.environ)`` → resolve value
+          - Subscript on dict literal: ``{"k": os.environ}["k"]``
+        Falls back to _resolve_rhs for Name/Attribute/BoolOp/IfExp.
+        """
+        # Direct resolution via _resolve_rhs (handles Name, Attribute, BoolOp, IfExp)
+        r = self._resolve_rhs(node)
+        if r is not None:
+            return r
+
+        # Call: try to resolve the first positional argument
+        if isinstance(node, ast.Call) and node.args:
+            return self._peel_to_resolve(node.args[0])
+
+        # NamedExpr: (x := dangerous)
+        if isinstance(node, ast.NamedExpr):
+            return self._peel_to_resolve(node.value)
 
         return None
 
@@ -330,6 +481,13 @@ class DangerousNodeVisitor(ast.NodeVisitor):
             # Fallback: check the final attr name against known dangerous funcs.
             if func.attr in _DANGEROUS_OS_FUNCS | _DANGEROUS_SUBPROCESS_FUNCS | _DANGEROUS_ASYNCIO_FUNCS:
                 self.flags.append("blocked.shell_injection")
+            # W16 HIGH-6: Peel simple wrappers to detect os.environ method calls.
+            # Catches: (lambda x: x)(os.environ).pop("PW"),
+            #          (env := os.environ).get("PW")
+            elif func.attr in _DANGEROUS_OS_ENVIRON_METHODS:
+                receiver_resolved = self._peel_to_resolve(func.value)
+                if receiver_resolved == "os.environ":
+                    self.flags.append("blocked.credential_exfil")
             return
 
         # Resolve the root through module aliases
@@ -431,9 +589,17 @@ class DangerousNodeVisitor(ast.NodeVisitor):
         if len(node.args) < 2:
             return
 
-        # W12.2: Block getattr(ANY_obj, dunder_attr) regardless of receiver type.
-        # Catches: getattr(object, "__subclasses__"), getattr(f, "__globals__"), etc.
+        # W12.2+W16 HIGH-3: Block getattr(ANY_obj, dunder_attr) regardless of
+        # receiver type.  W16: also resolve Name→Constant via alias tables to
+        # catch `a = "__globals__"; getattr(f, a)`.
         attr_arg = _get_constant_arg(node, 1)
+        if attr_arg is None:
+            # W16 HIGH-3: try constant propagation through name aliases
+            second = node.args[1]
+            if isinstance(second, ast.Name):
+                attr_arg = self._name_aliases.get(second.id)
+                if attr_arg is None and second.id in self._module_aliases:
+                    attr_arg = self._module_aliases[second.id]
         if attr_arg is not None and attr_arg in _DANGEROUS_DUNDER_ATTRS:
             self.flags.append("blocked.shell_injection")
             return
@@ -527,11 +693,13 @@ class DangerousNodeVisitor(ast.NodeVisitor):
         - os.environ[...] — credential exfiltration (M3/W12.2)
         - __builtins__[...] — sandbox escape via dict-style import (W12.3)
         """
-        # W12.3: __builtins__['__import__'] and __builtins__['eval'] etc.
-        if isinstance(node.value, ast.Name) and node.value.id == "__builtins__":
-            self.flags.append("blocked.shell_injection")
-            self.generic_visit(node)
-            return
+        # W12.3+W16: __builtins__['__import__'] etc. — also via alias
+        if isinstance(node.value, ast.Name):
+            builtins_name = node.value.id
+            if builtins_name == "__builtins__" or self._name_aliases.get(builtins_name) == "__builtins__":
+                self.flags.append("blocked.shell_injection")
+                self.generic_visit(node)
+                return
 
         is_os_environ = False
 
