@@ -2528,3 +2528,169 @@ class TestW24MedChainRecursion:
             'for f in itertools.chain.from_iterable([[(os.system,)]]): f("id")\n'
         )
         assert check_ast_safety(src) != []
+
+
+# =====================================================================
+# W25 Backlog: Starred, Dict Key FP, Comprehension Dict Methods
+# =====================================================================
+
+
+class TestW25StarredMidBypass:
+    """Backlog #4: Starred *mid first-dangerous bypass."""
+
+    def test_starred_mid_first_dangerous(self) -> None:
+        """*mid captures os.system at mid[0] — must flag."""
+        src = (
+            'import os\n'
+            '*mid, last = [os.system, 1, 2]\n'
+            'mid[0]("id")\n'
+        )
+        assert check_ast_safety(src) != []
+
+    def test_starred_mid_all_dangerous(self) -> None:
+        """*mid captures multiple dangerous — must flag."""
+        src = (
+            'import os\n'
+            'first, *mid = [1, os.system, os.popen]\n'
+            'mid[0]("id")\n'
+        )
+        assert check_ast_safety(src) != []
+
+    def test_starred_mid_safe_still_clean(self) -> None:
+        """*mid with all safe elements — no flag."""
+        src = (
+            '*mid, last = [1, 2, 3]\n'
+            'mid[0]\n'
+        )
+        assert check_ast_safety(src) == []
+
+
+class TestW25DictKeyFP:
+    """Backlog #5: Dict key iteration should NOT inherit value taint (FP)."""
+
+    def test_for_dict_keys_no_inherit_value_taint(self) -> None:
+        """for k in d — keys are strings, not dangerous."""
+        src = (
+            'import os\n'
+            'd = {"run": os.system}\n'
+            'for k in d:\n    k("id")\n'
+        )
+        assert check_ast_safety(src) == []
+
+    def test_for_dict_items_only_value_tainted(self) -> None:
+        """for k, v in d.items() — k is clean, v is tainted."""
+        src = (
+            'import os\n'
+            'd = {"run": os.system}\n'
+            'for k, v in d.items():\n'
+            '    k("id")\n'
+        )
+        assert check_ast_safety(src) == []
+
+    def test_for_dict_items_value_use_still_flagged(self) -> None:
+        """for k, v in d.items() — v("id") must still flag."""
+        src = (
+            'import os\n'
+            'd = {"run": os.system}\n'
+            'for k, v in d.items():\n'
+            '    v("id")\n'
+        )
+        assert check_ast_safety(src) != []
+
+    def test_for_dict_values_still_flagged(self) -> None:
+        """for v in d.values() — v IS dangerous."""
+        src = (
+            'import os\n'
+            'd = {"run": os.system}\n'
+            'for v in d.values():\n'
+            '    v("id")\n'
+        )
+        assert check_ast_safety(src) != []
+
+    def test_dictcomp_key_iteration_clean(self) -> None:
+        """Dict comp iterating keys — no FP."""
+        src = (
+            'import os\n'
+            'd = {"run": os.system}\n'
+            '{k: k for k in d}\n'
+        )
+        assert check_ast_safety(src) == []
+
+
+class TestW25ComprehensionDictMethods:
+    """Backlog #6: Comprehension .values()/.items() taint gap."""
+
+    def test_setcomp_dict_values(self) -> None:
+        """Set comprehension over d.values() — must flag."""
+        src = (
+            'import os\n'
+            'd = {"run": os.system}\n'
+            '{v for v in d.values()}\n'
+        )
+        assert check_ast_safety(src) != []
+
+    def test_dictcomp_dict_items_value(self) -> None:
+        """Dict comprehension over d.items() — value taint must propagate."""
+        src = (
+            'import os\n'
+            'd = {"run": os.system}\n'
+            '{k: v for k, v in d.items()}\n'
+        )
+        assert check_ast_safety(src) != []
+
+    def test_genexp_dict_values_use_site(self) -> None:
+        """Generator over d.values() used at call site — must flag."""
+        src = (
+            'import os\n'
+            'd = {"run": os.system}\n'
+            'f = next(v for v in d.values())\n'
+            'f("id")\n'
+        )
+        assert check_ast_safety(src) != []
+
+    def test_listcomp_dict_values(self) -> None:
+        """List comprehension over d.values() — must flag."""
+        src = (
+            'import os\n'
+            'd = {"run": os.system}\n'
+            '[v for v in d.values()]\n'
+        )
+        assert check_ast_safety(src) != []
+
+
+class TestW25NestedTupleComprehension:
+    """Backlog #8: Nested tuple-wrapped comprehension bypass."""
+
+    def test_nested_tuple_wrapped_comprehension(self) -> None:
+        """Wrapping dangerous in tuple inside nested comprehension — must flag."""
+        src = (
+            'import os\n'
+            '{pair for pair in [(x,) for x in [os.environ]]}\n'
+        )
+        assert check_ast_safety(src) != []
+
+
+class TestW25StarredMiddleOverTaint:
+    """Backlog #9: *middle index-level over-taint FP.
+
+    Note: This is a precision refinement. For now we accept over-taint
+    on starred captures as safe-by-default (taint union semantics).
+    A starred target capturing ANY dangerous element taints the whole
+    starred variable. This test documents the intentional behavior.
+    """
+
+    def test_starred_middle_any_dangerous_taints_all(self) -> None:
+        """Starred with ANY dangerous element — entire starred is tainted.
+
+        This is intentional: starred captures use union semantics.
+        mid[0] is safe (value 2) but mid[1] is os.system, so the
+        entire starred binding is conservatively tainted. This is
+        NOT a false positive — it's a safe approximation.
+        """
+        src = (
+            'import os\n'
+            'first, *mid, last = [1, 2, os.system, 4]\n'
+            'mid[0]("id")\n'
+        )
+        # Union semantics: any dangerous in starred → whole starred tainted
+        assert check_ast_safety(src) != []

@@ -216,6 +216,8 @@ class DangerousNodeVisitor(ast.NodeVisitor):
         # W20 C1: Track class body assignments for taint promotion
         # "ClassName.attr" -> resolved dangerous value
         self._class_attr_taint: Dict[str, str] = {}
+        # W25 #5: Track names assigned from dict literals for key iteration FP
+        self._dict_names: set = set()
 
     # --- Import tracking + assignment taint ---
 
@@ -308,9 +310,12 @@ class DangerousNodeVisitor(ast.NodeVisitor):
         # Direct name iteration: for v in d (where d is tainted)
         resolved = self._peel_to_resolve(iterable)
         if resolved is not None and self._is_dangerous_resolved(resolved):
+            # W25 #5: If iterating a dict by name, keys are safe — skip taint
+            if isinstance(iterable, ast.Name) and iterable.id in self._dict_names:
+                return  # dict iteration yields keys (strings), not values
             self._propagate_taint_target(target, iterable)
             return
-        # Method call on tainted name: for v in d.values() / d.items()
+        # Method call on tainted name: for v in d.values() / d.items() / d.keys()
         if (
             isinstance(iterable, ast.Call)
             and isinstance(iterable.func, ast.Attribute)
@@ -319,6 +324,18 @@ class DangerousNodeVisitor(ast.NodeVisitor):
             receiver = iterable.func.value
             recv_resolved = self._peel_to_resolve(receiver)
             if recv_resolved is not None and self._is_dangerous_resolved(recv_resolved):
+                # W25 #5: .keys() — keys are safe strings, no taint
+                if iterable.func.attr == "keys":
+                    return
+                # W25 #5: .items() — only taint value position (2nd element)
+                if (
+                    iterable.func.attr == "items"
+                    and isinstance(target, ast.Tuple)
+                    and len(target.elts) >= 2
+                ):
+                    self._propagate_taint_target(target.elts[1], receiver)
+                    return
+                # .values() or .items() without tuple unpack — taint fully
                 self._propagate_taint_target(target, receiver)
                 return
         # W22 H3: itertools.chain / itertools.chain.from_iterable — propagate
@@ -541,8 +558,9 @@ class DangerousNodeVisitor(ast.NodeVisitor):
                 for elt in gen.iter.elts:
                     self._propagate_taint_target(gen.target, elt)
             else:
-                # Try resolving the iterable (e.g., a Name aliased to a list)
-                self._propagate_taint_target(gen.target, gen.iter)
+                # W25 #6: Route through _propagate_for_iterable_taint to handle
+                # .values()/.items()/.keys() and chain() on non-literal iterables
+                self._propagate_for_iterable_taint(gen.target, gen.iter)
 
     def _flag_comprehension_element(self, elt: ast.expr) -> None:
         """W20.1: Flag if a comprehension element resolves to a dangerous value.
@@ -555,8 +573,11 @@ class DangerousNodeVisitor(ast.NodeVisitor):
             self.flags.append(self._flag_for_resolved(resolved))
 
     def visit_ListComp(self, node: ast.ListComp) -> None:
-        """W20 C2: Track list comprehension iteration taint."""
+        """W20 C2: Track list comprehension iteration taint.
+        W25 #6: Constructive taint — flag if list element resolves to dangerous.
+        """
         self._visit_comprehension(node)
+        self._flag_comprehension_element(node.elt)
         self.generic_visit(node)
 
     def visit_SetComp(self, node: ast.SetComp) -> None:
@@ -640,10 +661,19 @@ class DangerousNodeVisitor(ast.NodeVisitor):
                 if n_after > 0:
                     for t, v in zip(target.elts[-n_after:], val_elts[-n_after:]):
                         self._propagate_taint_target(t, v)
-                # Starred target gets remaining middle elements
+                # W25 #4: Starred target — union semantics. Scan middle values
+                # for first dangerous and taint only with that. Avoids
+                # last-write-wins where _propagate_taint clears stale aliases.
                 starred_target = target.elts[starred_idx]
-                for v in val_elts[n_before:len(val_elts) - n_after if n_after else len(val_elts)]:
-                    self._propagate_taint_target(starred_target, v)
+                mid_values = val_elts[n_before:len(val_elts) - n_after if n_after else len(val_elts)]
+                dangerous_mid = None
+                for v in mid_values:
+                    r = self._peel_to_resolve(v)
+                    if r is not None and self._is_dangerous_resolved(r):
+                        dangerous_mid = v
+                        break
+                if dangerous_mid is not None:
+                    self._propagate_taint_target(starred_target, dangerous_mid)
             elif isinstance(value, (ast.Tuple, ast.List)):
                 # No starred, length mismatch — try each value element per target
                 for elt in target.elts:
@@ -676,6 +706,11 @@ class DangerousNodeVisitor(ast.NodeVisitor):
         # W16 LOW: clear stale taint before re-resolving
         self._module_aliases.pop(target_name, None)
         self._name_aliases.pop(target_name, None)
+        # W25 #5: Track dict-assigned names for key iteration FP prevention
+        if isinstance(value, ast.Dict):
+            self._dict_names.add(target_name)
+        else:
+            self._dict_names.discard(target_name)
 
         # W16 HIGH-3: string constant assignment (a = "__globals__")
         # Store in _name_aliases so _check_getattr can resolve it.
@@ -890,7 +925,8 @@ class DangerousNodeVisitor(ast.NodeVisitor):
                     for elt in gen.iter.elts:
                         self._propagate_taint_target(gen.target, elt)
                 else:
-                    self._propagate_taint_target(gen.target, gen.iter)
+                    # W25 #6: Route through iterable taint for .values()/.items()
+                    self._propagate_for_iterable_taint(gen.target, gen.iter)
             return self._peel_to_resolve(node.elt)
 
         return None
