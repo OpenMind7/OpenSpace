@@ -508,3 +508,53 @@ def capabilities_need_shell(capabilities: frozenset[str]) -> bool:
         return True  # legacy / no manifest → fail-open
     return bool(capabilities & _SHELL_REQUIRING_CAPABILITIES)
 
+
+def allowed_backends_for_capabilities(
+    capabilities: frozenset[str],
+) -> Optional[frozenset[str]]:
+    """Return the set of backend names a skill may use, or None (allow all).
+
+    Returns None when *capabilities* is empty (legacy fail-open) so callers
+    can skip filtering entirely for backward compatibility.
+    """
+    if not capabilities:
+        return None  # legacy — no restriction
+    backends: set[str] = set()
+    for cap in capabilities:
+        mapped = CAPABILITY_TO_BACKENDS.get(cap)
+        if mapped:
+            backends.update(mapped)
+    # system backend is always allowed (internal tools like retrieve_skill)
+    backends.add("system")
+    return frozenset(backends)
+
+
+def filter_tools_by_capabilities(
+    tools: list,
+    capabilities: frozenset[str],
+) -> list:
+    """Remove tools whose backend is not permitted by *capabilities*.
+
+    Legacy skills (empty capabilities) pass all tools through unchanged.
+    Tools with backend_type NOT_SET or SYSTEM always pass.
+    """
+    allowed = allowed_backends_for_capabilities(capabilities)
+    if allowed is None:
+        return tools  # legacy — no filtering
+
+    filtered = []
+    for tool in tools:
+        bt = getattr(tool, "backend_type", None)
+        if bt is None:
+            filtered.append(tool)  # unknown structure — pass through
+            continue
+        backend_value = bt.value if hasattr(bt, "value") else str(bt)
+        if backend_value in allowed or backend_value == "not_set":
+            filtered.append(tool)
+        else:
+            logger.info(
+                f"Capability filter: dropped tool '{getattr(tool, 'name', '?')}' "
+                f"(backend={backend_value}, allowed={sorted(allowed)})"
+            )
+    return filtered
+

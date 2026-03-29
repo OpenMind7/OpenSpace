@@ -591,6 +591,19 @@ class GroundingAgent(BaseAgent):
             logger.warning(f"Auto-search tools failed, falling back to full list: {e}")
             tools = await self._load_all_tools(grounding_client)
 
+        # W15.4: Capability enforcement — restrict tools to those allowed by
+        # the active skill's declared capabilities.  Legacy skills (empty
+        # capabilities) pass through unfiltered (fail-open).
+        if self.has_skill_context and self._skill_capabilities:
+            from openspace.skill_engine.skill_utils import filter_tools_by_capabilities
+            pre_count = len(tools)
+            tools = filter_tools_by_capabilities(tools, self._skill_capabilities)
+            if len(tools) < pre_count:
+                logger.info(
+                    f"Capability enforcement: {pre_count} → {len(tools)} tools "
+                    f"(capabilities={sorted(self._skill_capabilities)})"
+                )
+
         # Append retrieve_skill tool when skill registry is available
         if self._skill_registry and self._skill_registry.list_skills():
             from openspace.skill_engine.retrieve_tool import RetrieveSkillTool

@@ -384,3 +384,130 @@ class TestBackwardCompatibility:
                 available, session_backends=None, session_tool_names=None,
             )
             assert len(filtered) == len(available)
+
+
+# ---------------------------------------------------------------------------
+# Group 7: W15.4 — Runtime tool filtering by capability
+# ---------------------------------------------------------------------------
+
+
+class _FakeTool:
+    """Minimal tool stub with backend_type for filter tests."""
+
+    def __init__(self, name: str, backend_value: str) -> None:
+        self.name = name
+        # Simulate BackendType enum
+        self.backend_type = type("BT", (), {"value": backend_value})()
+
+
+class TestFilterToolsByCapabilities:
+    """Tests for filter_tools_by_capabilities + allowed_backends_for_capabilities."""
+
+    def test_empty_capabilities_returns_all(self) -> None:
+        """Legacy skills (no capabilities) → no filtering."""
+        from openspace.skill_engine.skill_utils import filter_tools_by_capabilities
+
+        tools = [_FakeTool("a", "shell"), _FakeTool("b", "mcp"), _FakeTool("c", "gui")]
+        result = filter_tools_by_capabilities(tools, frozenset())
+        assert len(result) == 3
+
+    def test_subprocess_allows_shell_only(self) -> None:
+        """subprocess capability → only shell + system tools pass."""
+        from openspace.skill_engine.skill_utils import filter_tools_by_capabilities
+
+        tools = [
+            _FakeTool("run_cmd", "shell"),
+            _FakeTool("browse", "web"),
+            _FakeTool("click", "gui"),
+            _FakeTool("api_call", "mcp"),
+            _FakeTool("internal", "system"),
+        ]
+        result = filter_tools_by_capabilities(tools, frozenset({"subprocess"}))
+        names = {t.name for t in result}
+        assert names == {"run_cmd", "internal"}
+
+    def test_network_allows_mcp_only(self) -> None:
+        """network capability → only mcp + system tools pass."""
+        from openspace.skill_engine.skill_utils import filter_tools_by_capabilities
+
+        tools = [
+            _FakeTool("run_cmd", "shell"),
+            _FakeTool("api_call", "mcp"),
+            _FakeTool("internal", "system"),
+        ]
+        result = filter_tools_by_capabilities(tools, frozenset({"network"}))
+        names = {t.name for t in result}
+        assert names == {"api_call", "internal"}
+
+    def test_filesystem_allows_shell_and_mcp(self) -> None:
+        """filesystem → shell + mcp + system."""
+        from openspace.skill_engine.skill_utils import filter_tools_by_capabilities
+
+        tools = [
+            _FakeTool("run_cmd", "shell"),
+            _FakeTool("api_call", "mcp"),
+            _FakeTool("browse", "web"),
+            _FakeTool("internal", "system"),
+        ]
+        result = filter_tools_by_capabilities(tools, frozenset({"filesystem"}))
+        names = {t.name for t in result}
+        assert names == {"run_cmd", "api_call", "internal"}
+
+    def test_multiple_capabilities_union(self) -> None:
+        """Multiple capabilities → union of their backends."""
+        from openspace.skill_engine.skill_utils import filter_tools_by_capabilities
+
+        tools = [
+            _FakeTool("run_cmd", "shell"),
+            _FakeTool("api_call", "mcp"),
+            _FakeTool("browse", "web"),
+            _FakeTool("click", "gui"),
+        ]
+        result = filter_tools_by_capabilities(
+            tools, frozenset({"subprocess", "network"})
+        )
+        names = {t.name for t in result}
+        assert names == {"run_cmd", "api_call"}
+
+    def test_not_set_backend_passes_through(self) -> None:
+        """Tools with NOT_SET backend always pass through."""
+        from openspace.skill_engine.skill_utils import filter_tools_by_capabilities
+
+        tools = [_FakeTool("unknown", "not_set"), _FakeTool("browse", "web")]
+        result = filter_tools_by_capabilities(tools, frozenset({"subprocess"}))
+        names = {t.name for t in result}
+        assert "unknown" in names
+        assert "browse" not in names
+
+    def test_tool_without_backend_type_passes(self) -> None:
+        """Tools with no backend_type attribute pass through."""
+        from openspace.skill_engine.skill_utils import filter_tools_by_capabilities
+
+        class BareObj:
+            name = "bare"
+
+        tools = [BareObj(), _FakeTool("browse", "web")]
+        result = filter_tools_by_capabilities(tools, frozenset({"subprocess"}))
+        assert any(getattr(t, "name", None) == "bare" for t in result)
+
+    def test_system_backend_always_allowed(self) -> None:
+        """system tools pass regardless of capabilities."""
+        from openspace.skill_engine.skill_utils import filter_tools_by_capabilities
+
+        tools = [_FakeTool("retrieve_skill", "system")]
+        result = filter_tools_by_capabilities(tools, frozenset({"network"}))
+        assert len(result) == 1
+
+    def test_allowed_backends_returns_none_for_empty(self) -> None:
+        """allowed_backends_for_capabilities returns None for empty caps."""
+        from openspace.skill_engine.skill_utils import allowed_backends_for_capabilities
+
+        assert allowed_backends_for_capabilities(frozenset()) is None
+
+    def test_allowed_backends_includes_system(self) -> None:
+        """system is always in the allowed set."""
+        from openspace.skill_engine.skill_utils import allowed_backends_for_capabilities
+
+        result = allowed_backends_for_capabilities(frozenset({"subprocess"}))
+        assert result is not None
+        assert "system" in result

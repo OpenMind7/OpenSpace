@@ -405,7 +405,12 @@ def launch_app():
             command[index] = 'chromium'
             logger.info("ARM architecture detected: replacing 'google-chrome' with 'chromium'")
         
-        subprocess.Popen(command, shell=shell)
+        subprocess.Popen(
+            command,
+            shell=shell,
+            env=sanitize_env(None),
+            start_new_session=True,
+        )
         cmd_str = command if shell else " ".join(command)
         logger.info(f"Application launched successfully: {cmd_str}")
         return jsonify({
@@ -989,14 +994,16 @@ def open_file():
     
     try:
         path = os.path.expanduser(path)
-        
+        path = os.path.realpath(path)  # W15.5: resolve symlinks to prevent traversal
+
         if not os.path.exists(path):
             return jsonify({'status': 'error', 'message': f'File not found: {path}'}), 404
-        
+
+        safe_env = sanitize_env(None)
         if platform_name == "Darwin":
-            subprocess.Popen(['open', path])
+            subprocess.Popen(['open', path], env=safe_env, start_new_session=True)
         elif platform_name == "Linux":
-            subprocess.Popen(['xdg-open', path])
+            subprocess.Popen(['xdg-open', path], env=safe_env, start_new_session=True)
         elif platform_name == "Windows":
             os.startfile(path)
         
