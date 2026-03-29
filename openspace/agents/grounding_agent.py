@@ -559,13 +559,25 @@ class GroundingAgent(BaseAgent):
         # Ensure shell backend is available when skills need it.
         # Legacy skills (no capabilities) get shell (fail-open).
         # Skills declaring only network/cloud_api skip shell auto-add.
+        # S5: Only auto-add shell if "shell" was in the original backend_scope.
+        # If the session explicitly excluded shell, respect that boundary —
+        # never escalate privileges via skill capability declarations.
         if self.has_skill_context:
             from openspace.skill_engine.skill_utils import capabilities_need_shell
             if capabilities_need_shell(self._skill_capabilities):
                 shell_bt = BackendType.SHELL
                 if shell_bt not in backends:
-                    backends = list(backends) + [shell_bt]
-                    logger.info("Added Shell backend to scope for skill capabilities")
+                    if "shell" in self._backend_scope:
+                        # Shell is in scope but not yet in the BackendType list
+                        # (shouldn't normally happen, but guard anyway)
+                        backends = list(backends) + [shell_bt]
+                        logger.info("Added Shell backend to scope for skill capabilities")
+                    else:
+                        # S5 guard: session explicitly excluded shell — do NOT escalate
+                        logger.warning(
+                            "Skill capabilities require shell but session scope "
+                            "excludes it — not escalating (S5 shell-guard)"
+                        )
 
         try:
             retrieval_llm = self._tool_retrieval_llm or self._llm_client

@@ -64,6 +64,7 @@ _BLOCKING_FLAGS = frozenset({
     "blocked.credential_exfil",
     "blocked.unreadable_file",        # fail-closed: unreadable helper file
     "blocked.unreadable_directory",   # fail-closed: unreadable skill directory
+    "blocked.unparseable_code",       # S1: fail-closed on SyntaxError (polyglot bypass)
 })
 
 

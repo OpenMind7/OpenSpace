@@ -5,7 +5,7 @@ dangerous operations (shell injection, credential exfiltration), and handles eva
 vectors that regex screening cannot catch (alias tracking, dynamic imports, attribute
 chains).
 
-7 test groups, 44 cases:
+8 test groups, 57 cases:
   1. Evasion vectors (15)  — attacks that bypass regex but AST catches
   2. Alias tracking (5)    — import-as, from-import-as, chained aliases
   3. Markdown extraction (7) — fenced code blocks, heredocs, edge cases
@@ -13,6 +13,7 @@ chains).
   5. Syntax errors (3)     — malformed Python handled gracefully
   6. Backward compat (4)   — AST flags use same names as existing regex flags
   7. Performance (2)        — large inputs don't hang or OOM
+  8. Adversarial coverage (13) — S9: targeted tests for W12 fixes
 """
 
 from __future__ import annotations
@@ -228,11 +229,10 @@ class TestFalsePositivePrevention:
         blocking = [f for f in flags if f in _BLOCKING_FLAGS]
         assert not blocking
 
-    def test_open_with_variable_arg_safe(self) -> None:
-        """open() with non-constant arg — allowed (too many false positives)."""
+    def test_open_with_variable_arg_blocked(self) -> None:
+        """S3: open() with non-constant arg — fail-closed (exfil via variable)."""
         flags = check_ast_safety("filename = get_path()\nf = open(filename)")
-        blocking = [f for f in flags if f in _BLOCKING_FLAGS]
-        assert not blocking
+        assert "blocked.credential_exfil" in flags
 
     def test_print_and_math_safe(self) -> None:
         src = "import math\nprint(math.sqrt(16))\nresult = 2 ** 10"
@@ -356,3 +356,117 @@ class TestPerformance:
         flags = check_python_blocks_safety(md)
         blocking = [f for f in flags if f in _BLOCKING_FLAGS]
         assert not blocking
+
+
+# ---------------------------------------------------------------------------
+# Group 8 — Adversarial coverage (13 cases) — S9
+# Targeted tests for each W12 security fix to prevent regressions.
+# ---------------------------------------------------------------------------
+
+class TestAdversarialW12:
+    """S9: Adversarial tests covering every W12 fix vector."""
+
+    # --- S1: SyntaxError fail-closed for fenced blocks ---
+
+    def test_polyglot_syntax_error_fail_closed(self) -> None:
+        """Polyglot payload that fails Python parse — must be blocked (S1)."""
+        # PHP/Python polyglot that SyntaxError's in Python
+        src = "<?php system('whoami'); ?>\neval('import os')"
+        flags = check_ast_safety(src, fail_closed=True)
+        assert "blocked.unparseable_code" in flags
+
+    def test_syntax_error_fail_open_speculative(self) -> None:
+        """Speculative parse (fail_closed=False) should NOT block on SyntaxError."""
+        src = "<?php echo 'hello'; ?>"
+        flags = check_ast_safety(src, fail_closed=False)
+        assert "blocked.unparseable_code" not in flags
+
+    # --- S2: breakpoint(), sys.modules, types module ---
+
+    def test_breakpoint_builtin_blocked(self) -> None:
+        """breakpoint() drops into interactive debugger — must block (S2)."""
+        flags = check_ast_safety("breakpoint()")
+        assert "blocked.shell_injection" in flags
+
+    def test_sys_modules_access_blocked(self) -> None:
+        """sys.modules manipulation enables module hijacking (S2)."""
+        flags = check_ast_safety("import sys\nsys.modules['os'] = fake_os")
+        assert "blocked.shell_injection" in flags
+
+    def test_sys_getframe_blocked(self) -> None:
+        """sys._getframe() leaks caller stack frames (S2)."""
+        flags = check_ast_safety("import sys\nframe = sys._getframe(0)")
+        assert "blocked.shell_injection" in flags
+
+    def test_types_module_import_blocked(self) -> None:
+        """types module enables function construction from bytecode (S2)."""
+        src = "import types\nf = types.FunctionType(code_obj, {})"
+        flags = check_ast_safety(src)
+        # types is in _DANGEROUS_META_MODULES → any call should be blocked
+        assert "blocked.shell_injection" in flags
+
+    # --- S3: open() with variable path ---
+
+    def test_open_variable_path_fail_closed(self) -> None:
+        """open() with computed path — credential exfil via variable (S3)."""
+        src = "path = user_input + '/.ssh/id_rsa'\nf = open(path)"
+        flags = check_ast_safety(src)
+        assert "blocked.credential_exfil" in flags
+
+    # --- S6: Heredoc with full /usr/bin/python3 path ---
+
+    def test_heredoc_full_path_python(self) -> None:
+        """Heredoc using /usr/bin/python3 should be extracted (S6)."""
+        md = textwrap.dedent("""\
+            ```bash
+            /usr/bin/python3 <<'PYEOF'
+            import subprocess
+            subprocess.run(['id'])
+            PYEOF
+            ```
+        """)
+        flags = check_python_blocks_safety(md)
+        assert "blocked.shell_injection" in flags
+
+    def test_heredoc_python311_versioned(self) -> None:
+        """Heredoc using python3.11 versioned path (S6)."""
+        md = textwrap.dedent("""\
+            ```bash
+            /usr/local/bin/python3.11 <<'END'
+            import os
+            os.system('whoami')
+            END
+            ```
+        """)
+        flags = check_python_blocks_safety(md)
+        assert "blocked.shell_injection" in flags
+
+    # --- S7/S8: getattr on nested module attribute ---
+
+    def test_getattr_nested_module_attribute(self) -> None:
+        """getattr(some.module, dynamic_attr) — S8 extended resolution."""
+        src = textwrap.dedent("""\
+            import importlib
+            attr = get_user_input()
+            getattr(importlib, attr)()
+        """)
+        flags = check_ast_safety(src)
+        assert "blocked.shell_injection" in flags
+
+    # --- M3: os.environ subscript ---
+
+    def test_os_environ_sensitive_key(self) -> None:
+        """os.environ['API_KEY'] — sensitive constant key (M3)."""
+        flags = check_ast_safety("import os\nkey = os.environ['API_SECRET_KEY']")
+        assert "blocked.credential_exfil" in flags
+
+    def test_os_environ_dynamic_key(self) -> None:
+        """os.environ[variable] — non-constant key fail-closed (M3)."""
+        flags = check_ast_safety("import os\nk = get_key()\nval = os.environ[k]")
+        assert "blocked.credential_exfil" in flags
+
+    def test_os_environ_safe_key_no_block(self) -> None:
+        """os.environ['HOME'] — non-sensitive constant key should NOT block."""
+        flags = check_ast_safety("import os\nhome = os.environ['HOME']")
+        blocking = [f for f in flags if f in _BLOCKING_FLAGS]
+        assert not blocking, f"False positive on safe environ key: {blocking}"

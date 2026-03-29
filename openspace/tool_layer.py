@@ -715,6 +715,17 @@ class OpenSpace:
         if self._grounding_agent and self._grounding_agent.backend_scope:
             agent_backends_set = frozenset(self._grounding_agent.backend_scope)
 
+        # M4: Gather session tool names for capability-based filtering.
+        # Uses cached tools from last execution (empty on first call — acceptable,
+        # since session_tool_names is an optional refinement filter).
+        session_tool_names_set: Optional[frozenset[str]] = None
+        if self._grounding_agent:
+            last_tools = getattr(self._grounding_agent, "_last_tools", [])
+            if last_tools:
+                session_tool_names_set = frozenset(
+                    t.name for t in last_tools if hasattr(t, "name")
+                )
+
         if skill_llm:
             selected, selection_record = await self._skill_registry.select_skills_with_llm(
                 task,
@@ -723,6 +734,7 @@ class OpenSpace:
                 skill_quality=skill_quality,
                 store=self._skill_store,
                 session_backends=agent_backends_set,
+                session_tool_names=session_tool_names_set,
             )
         else:
             # No LLM client — use local prefilter (BM25+embedding, Stage 3 if enabled)

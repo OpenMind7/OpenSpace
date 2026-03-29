@@ -8,7 +8,7 @@ Design principles:
   - Single O(n) AST walk per source — no repeated traversals.
   - Alias-aware: tracks ``import X as Y`` and ``from X import Y as Z``.
   - Fail-closed on ambiguity: dynamic attrs on dangerous modules → block.
-  - Fail-open on SyntaxError: skip unparseable blocks (regex still runs).
+  - Fail-closed on SyntaxError: unparseable code is blocked (S1 fix).
   - Reuses existing flag names: ``blocked.shell_injection``,
     ``blocked.credential_exfil``.
 """
@@ -47,8 +47,16 @@ _DANGEROUS_EXFIL_MODULES: frozenset[str] = frozenset({
     "http.server",                       # expose local files via HTTP
 })
 
+# S2: Modules that enable type/code construction
+_DANGEROUS_META_MODULES: frozenset[str] = frozenset({
+    "types",       # types.FunctionType / types.CodeType → construct functions from bytecode
+    "dis",         # bytecode disassembly (info leak, paired with types → dangerous)
+})
+
 # All modules considered dangerous (union for general checks)
-_ALL_DANGEROUS_MODULES: frozenset[str] = _DANGEROUS_EXEC_MODULES | _DANGEROUS_EXFIL_MODULES
+_ALL_DANGEROUS_MODULES: frozenset[str] = (
+    _DANGEROUS_EXEC_MODULES | _DANGEROUS_EXFIL_MODULES | _DANGEROUS_META_MODULES
+)
 
 # Modules where ANY call is dangerous (promoted from inline set — H2 fix)
 _ANY_CALL_BLOCKED_MODULES: frozenset[str] = frozenset({"ctypes", "pty", "commands"})
@@ -83,6 +91,13 @@ _SENSITIVE_PATH_FRAGMENTS: frozenset[str] = frozenset({
 # Builtins that are blanket-blocked (no legitimate use in skill code)
 _BLANKET_BLOCKED_BUILTINS: frozenset[str] = frozenset({
     "eval", "exec", "compile",
+    "breakpoint",  # S2: drops into interactive debugger → shell access
+})
+
+# S2: sys module dangerous attributes (checked via visit_Attribute)
+_DANGEROUS_SYS_ATTRS: frozenset[str] = frozenset({
+    "modules",     # sys.modules — module manipulation / hijacking
+    "_getframe",   # stack frame access → inspect caller code
 })
 
 
@@ -96,9 +111,9 @@ _PYTHON_FENCE_RE = re.compile(
     re.DOTALL,
 )
 
-# Heredoc Python in bash blocks: python3 <<'EOF' ... EOF
+# S6: Heredoc Python in bash blocks — matches python3, /usr/bin/python3.11, etc.
 _HEREDOC_PYTHON_RE = re.compile(
-    r"python[23]?\s+<<['\"]?(\w+)['\"]?\s*\n(.*?)\n\1",
+    r"(?:/[\w/.-]*)?python[23]?(?:\.\d+)?\s+<<['\"]?(\w+)['\"]?\s*\n(.*?)\n\1",
     re.DOTALL,
 )
 
@@ -200,6 +215,10 @@ class DangerousNodeVisitor(ast.NodeVisitor):
         """Check a dotted call like ``os.system(...)`` or ``sp.Popen(...)``."""
         chain = _resolve_attr_chain(func)
         if chain is None:
+            # S7: Chain contains subscripts/calls (e.g., foo()[0].bar.system()).
+            # Fallback: check the final attr name against known dangerous funcs.
+            if func.attr in _DANGEROUS_OS_FUNCS | _DANGEROUS_SUBPROCESS_FUNCS | _DANGEROUS_ASYNCIO_FUNCS:
+                self.flags.append("blocked.shell_injection")
             return
 
         # Resolve the root through module aliases
@@ -253,9 +272,9 @@ class DangerousNodeVisitor(ast.NodeVisitor):
             self.flags.append("blocked.shell_injection")
             return
 
-        # Any call on a dangerous exec/exfil module's submodule (e.g., importlib.util.*)
+        # Any call on a dangerous exec/meta module's submodule (e.g., importlib.util.*)
         root_module = module_part.split(".")[0]
-        if root_module in _DANGEROUS_EXEC_MODULES:
+        if root_module in _DANGEROUS_EXEC_MODULES or root_module in _DANGEROUS_META_MODULES:
             self.flags.append("blocked.shell_injection")
             return
         if root_module in _DANGEROUS_EXFIL_MODULES:
@@ -268,17 +287,32 @@ class DangerousNodeVisitor(ast.NodeVisitor):
             pass
 
     def _check_getattr(self, node: ast.Call) -> None:
-        """Check ``getattr(module, attr)`` for dangerous module + dynamic attr."""
+        """Check ``getattr(module, attr)`` for dangerous module + dynamic attr.
+
+        S8: Handles both ``getattr(os, ...)`` (ast.Name) and
+        ``getattr(some.module, ...)`` (ast.Attribute).
+        """
         if len(node.args) < 2:
             return
 
         obj = node.args[0]
-        if not isinstance(obj, ast.Name):
-            return
+        resolved_mod: Optional[str] = None
 
-        obj_name = obj.id
-        # Resolve through aliases
-        resolved_mod = self._module_aliases.get(obj_name, obj_name)
+        if isinstance(obj, ast.Name):
+            resolved_mod = self._module_aliases.get(obj.id, obj.id)
+        elif isinstance(obj, ast.Attribute):
+            # S8: getattr(some.module, "func") — resolve the attribute chain
+            chain = _resolve_attr_chain(obj)
+            if chain is not None:
+                parts = chain.split(".", 1)
+                root = parts[0]
+                if root in self._module_aliases:
+                    resolved_mod = f"{self._module_aliases[root]}.{parts[1]}" if len(parts) > 1 else self._module_aliases[root]
+                else:
+                    resolved_mod = chain
+
+        if resolved_mod is None:
+            return
 
         if resolved_mod in _ALL_DANGEROUS_MODULES or resolved_mod == "os":
             attr_arg = _get_constant_arg(node, 1)
@@ -292,6 +326,46 @@ class DangerousNodeVisitor(ast.NodeVisitor):
                 self.flags.append("blocked.shell_injection")
             elif resolved_mod == "subprocess" and attr_arg in _DANGEROUS_SUBPROCESS_FUNCS:
                 self.flags.append("blocked.shell_injection")
+
+    # --- S2: Attribute access on dangerous modules (non-call) ---
+
+    def visit_Attribute(self, node: ast.Attribute) -> None:
+        """Detect dangerous attribute access even without a call.
+
+        Catches: sys.modules, sys._getframe (S2).
+        """
+        if isinstance(node.value, ast.Name):
+            obj_name = node.value.id
+            resolved = self._module_aliases.get(obj_name, obj_name)
+            if resolved == "sys" and node.attr in _DANGEROUS_SYS_ATTRS:
+                self.flags.append("blocked.shell_injection")
+        self.generic_visit(node)
+
+    # --- M3: Subscript access on os.environ ---
+
+    def visit_Subscript(self, node: ast.Subscript) -> None:
+        """Detect os.environ[...] subscript access for credential exfiltration.
+
+        Both constant sensitive keys and non-constant keys are flagged.
+        """
+        if isinstance(node.value, ast.Attribute) and node.value.attr == "environ":
+            if isinstance(node.value.value, ast.Name):
+                obj_name = node.value.value.id
+                resolved = self._module_aliases.get(obj_name, obj_name)
+                if resolved == "os":
+                    # Check if the key is a sensitive constant
+                    key = None
+                    if isinstance(node.slice, ast.Constant) and isinstance(node.slice.value, str):
+                        key = node.slice.value
+                    if key is not None:
+                        key_upper = key.upper()
+                        sensitive_keywords = {"KEY", "TOKEN", "SECRET", "PASSWORD", "CREDENTIAL", "PRIVATE"}
+                        if any(kw in key_upper for kw in sensitive_keywords):
+                            self.flags.append("blocked.credential_exfil")
+                    else:
+                        # Non-constant key — fail-closed
+                        self.flags.append("blocked.credential_exfil")
+        self.generic_visit(node)
 
     # --- Main visit_Call (single entry point for all call analysis) ---
 
@@ -313,10 +387,16 @@ class DangerousNodeVisitor(ast.NodeVisitor):
         self.generic_visit(node)
 
     def _check_open_sensitive(self, node: ast.Call) -> None:
-        """Flag open() calls with constant paths pointing to sensitive files."""
+        """Flag open() calls with sensitive or non-constant paths.
+
+        S3: Non-constant paths are fail-closed (could be variable-based exfil).
+        Constant paths are checked against _SENSITIVE_PATH_FRAGMENTS.
+        """
         path_arg = _get_constant_arg(node, 0)
         if path_arg is None:
-            return  # Non-constant arg — allow (too many false positives)
+            # S3: Non-constant path — fail-closed (could exfiltrate via variable)
+            self.flags.append("blocked.credential_exfil")
+            return
 
         path_lower = path_arg.lower()
         for fragment in _SENSITIVE_PATH_FRAGMENTS:
@@ -369,16 +449,24 @@ def _get_constant_arg(call: ast.Call, pos: int) -> Optional[str]:
 # Public API
 # ---------------------------------------------------------------------------
 
-def check_ast_safety(source: str) -> List[str]:
+def check_ast_safety(source: str, *, fail_closed: bool = True) -> List[str]:
     """Parse a single Python source string and check for dangerous operations.
 
     Returns a list of triggered flag names (empty = safe).
-    On ``SyntaxError``, returns an empty list (fall through to regex).
+
+    Args:
+        source: Python source code to analyze.
+        fail_closed: S1 fix — if True (default), SyntaxError returns
+            ``["blocked.unparseable_code"]``.  Set to False for speculative
+            parsing (e.g., trying markdown as Python).
     """
     try:
         tree = ast.parse(source)
     except SyntaxError as exc:
-        logger.warning("AST parse failed (falling through to regex): %s", exc)
+        if fail_closed:
+            logger.warning("AST parse failed — fail-closed (S1): %s", exc)
+            return ["blocked.unparseable_code"]
+        logger.debug("AST parse failed — fail-open (speculative): %s", exc)
         return []
 
     visitor = DangerousNodeVisitor()
@@ -393,15 +481,16 @@ def check_python_blocks_safety(text: str) -> List[str]:
 
     Extracts fenced Python blocks and heredoc Python from the text.
     If no fenced blocks are found, tries to parse the entire text as Python
-    (fast path for plain .py files).
+    (fast path for plain .py files — fail-open since it's speculative).
 
     Returns a deduplicated list of triggered flag names.
     """
     blocks = extract_python_blocks(text)
 
     if not blocks:
-        # No fenced blocks found — try parsing the entire text as Python
-        return check_ast_safety(text)
+        # No fenced blocks found — try parsing the entire text as Python.
+        # Speculative: fail-open since this might be markdown, not Python.
+        return check_ast_safety(text, fail_closed=False)
 
     all_flags: List[str] = []
     for block in blocks:
