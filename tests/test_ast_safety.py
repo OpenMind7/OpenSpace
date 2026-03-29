@@ -603,3 +603,71 @@ class TestAdversarialW12:
         src = "import builtins\nd = getattr(builtins, '__dict__')"
         flags = check_ast_safety(src)
         assert "blocked.shell_injection" in flags
+
+    # --- W12.3: Codex-identified bypass fixes ---
+
+    def test_builtins_subscript_import(self) -> None:
+        """CRIT: __builtins__['__import__']('os') must be blocked."""
+        src = "__builtins__['__import__']('os')"
+        flags = check_ast_safety(src)
+        assert "blocked.shell_injection" in flags
+
+    def test_builtins_subscript_eval(self) -> None:
+        """CRIT: __builtins__['eval']('code') must be blocked."""
+        src = "__builtins__['eval']('code')"
+        flags = check_ast_safety(src)
+        assert "blocked.shell_injection" in flags
+
+    def test_builtins_getattribute_import(self) -> None:
+        """CRIT: builtins.__getattribute__('__import__')('os') must be blocked."""
+        src = "import builtins\nbuiltins.__getattribute__('__import__')('os')"
+        flags = check_ast_safety(src)
+        assert "blocked.shell_injection" in flags
+
+    def test_builtins_getattribute_dict(self) -> None:
+        """CRIT: builtins.__getattribute__('__dict__') must be blocked."""
+        src = "import builtins\nbuiltins.__getattribute__('__dict__')"
+        flags = check_ast_safety(src)
+        assert "blocked.shell_injection" in flags
+
+    def test_object_getattribute_builtins(self) -> None:
+        """CRIT: object.__getattribute__(builtins, '__dict__') via getattr."""
+        src = "import builtins\nobject.__getattribute__(builtins, '__dict__')"
+        flags = check_ast_safety(src)
+        assert "blocked.shell_injection" in flags
+
+    def test_dict_os_environ(self) -> None:
+        """HIGH: dict(os.environ) copies all env vars — credential exfil."""
+        src = "import os\nall_env = dict(os.environ)"
+        flags = check_ast_safety(src)
+        assert "blocked.credential_exfil" in flags
+
+    def test_os_environ_copy(self) -> None:
+        """HIGH: os.environ.copy() copies all env vars — credential exfil."""
+        src = "import os\nall_env = os.environ.copy()"
+        flags = check_ast_safety(src)
+        assert "blocked.credential_exfil" in flags
+
+    def test_list_os_environ_items(self) -> None:
+        """HIGH: list(os.environ.items()) — whole-env copy."""
+        src = "import os\nall_items = list(os.environ.items())"
+        flags = check_ast_safety(src)
+        assert "blocked.credential_exfil" in flags
+
+    def test_os_environ_values(self) -> None:
+        """HIGH: os.environ.values() — credential exfil."""
+        src = "import os\nos.environ.values()"
+        flags = check_ast_safety(src)
+        assert "blocked.credential_exfil" in flags
+
+    def test_getattr_dunder_getattribute_any(self) -> None:
+        """W12.3: getattr(x, '__getattribute__') must be blocked."""
+        src = "getattr(obj, '__getattribute__')"
+        flags = check_ast_safety(src)
+        assert "blocked.shell_injection" in flags
+
+    def test_safe_getattr_no_false_positive(self) -> None:
+        """LOW: Safe getattr(obj, 'name') must NOT be flagged."""
+        src = "x = getattr(my_obj, 'some_attr')"
+        flags = check_ast_safety(src)
+        assert not any(f.startswith("blocked.") for f in flags)

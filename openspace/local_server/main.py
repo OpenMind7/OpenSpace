@@ -232,13 +232,11 @@ def execute_command():
             'returncode': result.returncode
         })
     except subprocess.TimeoutExpired as exc:
-        # W13: kill entire process group on timeout (not just the leader)
-        if exc.cmd and platform_name != "Windows":
-            try:
-                # The child runs in its own session, so pgid == its pid
-                os.killpg(os.getpgid(os.getpid()), signal.SIGKILL)
-            except (ProcessLookupError, OSError, PermissionError):
-                pass
+        # W13.2: subprocess.run() already kills the child on timeout (Python 3.x).
+        # The previous killpg(getpgid(getpid())) was a CRITICAL bug — it killed
+        # the SERVER's own process group.  Grandchild cleanup requires a Popen
+        # refactor (deferred to W14).
+        logger.warning("Command timed out after %ds: %s", timeout, exc.cmd)
         return jsonify({
             'status': 'error',
             'message': f'Command timeout after {timeout} seconds'

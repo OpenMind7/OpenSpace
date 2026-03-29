@@ -77,7 +77,14 @@ def sanitize_env(user_env: Optional[Dict[str, str]]) -> Dict[str, str]:
     blocked = []
     for key, value in user_env.items():
         upper_key = key.upper()
-        if upper_key in _DANGEROUS_ENV_VARS or upper_key.startswith("LD_") or upper_key.startswith("DYLD_"):
+        if (
+            upper_key in _DANGEROUS_ENV_VARS
+            or upper_key.startswith("LD_")
+            or upper_key.startswith("DYLD_")
+            # W13.2: shell function injection (BASH_FUNC_*) and interpreter hooks
+            or upper_key.startswith("BASH_FUNC_")
+            or upper_key.startswith("PYTHON")  # catches PYTHONDONTWRITEBYTECODE etc.
+        ):
             blocked.append(key)
         else:
             base[key] = value

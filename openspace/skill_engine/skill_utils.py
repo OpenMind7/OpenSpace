@@ -476,6 +476,10 @@ def capabilities_need_shell(capabilities: frozenset[str]) -> bool:
     cloud_api-only skills skip shell auto-add.
     """
     if not capabilities:
+        logger.warning(
+            "capabilities_need_shell: empty capability set — fail-open to True "
+            "(legacy skill without manifest). Consider adding capability declarations.",
+        )
         return True  # legacy / no manifest → fail-open
     return bool(capabilities & _SHELL_REQUIRING_CAPABILITIES)
 

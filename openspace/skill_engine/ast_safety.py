@@ -78,6 +78,8 @@ _DANGEROUS_OS_FUNCS: frozenset[str] = frozenset({
 # W12.1: os.environ method calls that access credentials
 _DANGEROUS_OS_ENVIRON_METHODS: frozenset[str] = frozenset({
     "get", "pop", "setdefault",
+    # W12.3: whole-environment copy paths (Codex finding)
+    "copy", "items", "values", "keys",
 })
 
 _DANGEROUS_SUBPROCESS_FUNCS: frozenset[str] = frozenset({
@@ -118,6 +120,8 @@ _DANGEROUS_DUNDER_ATTRS: frozenset[str] = frozenset({
     "__import__",      # dunder import as attribute access
     # W12.2: builtins.__dict__["__import__"] bypass (Codex finding)
     "__dict__",        # dict access → builtins.__dict__["__import__"] → arbitrary import
+    # W12.3: builtins.__getattribute__('__import__') bypass (Codex finding)
+    "__getattribute__",  # introspection → reaches any attr including __import__
 })
 
 # S2: sys module dangerous attributes (checked via visit_Attribute)
@@ -275,6 +279,10 @@ class DangerousNodeVisitor(ast.NodeVisitor):
         if module_part == "builtins" and func_name == "__import__":
             self.flags.append("blocked.shell_injection")
             return
+        # W12.3: builtins.__getattribute__() and other dunder methods (Codex finding)
+        if module_part == "builtins" and func_name in _DANGEROUS_DUNDER_ATTRS:
+            self.flags.append("blocked.shell_injection")
+            return
 
         # os.dangerous_func() — shell execution
         if module_part == "os" and func_name in _DANGEROUS_OS_FUNCS:
@@ -402,11 +410,18 @@ class DangerousNodeVisitor(ast.NodeVisitor):
     # --- M3: Subscript access on os.environ ---
 
     def visit_Subscript(self, node: ast.Subscript) -> None:
-        """Detect os.environ[...] subscript access for credential exfiltration.
+        """Detect dangerous subscript access patterns.
 
-        Both constant sensitive keys and non-constant keys are flagged.
-        W12.2: Also handles aliased environ (from os import environ; environ["KEY"]).
+        Handles:
+        - os.environ[...] — credential exfiltration (M3/W12.2)
+        - __builtins__[...] — sandbox escape via dict-style import (W12.3)
         """
+        # W12.3: __builtins__['__import__'] and __builtins__['eval'] etc.
+        if isinstance(node.value, ast.Name) and node.value.id == "__builtins__":
+            self.flags.append("blocked.shell_injection")
+            self.generic_visit(node)
+            return
+
         is_os_environ = False
 
         if isinstance(node.value, ast.Attribute) and node.value.attr == "environ":
@@ -452,6 +467,10 @@ class DangerousNodeVisitor(ast.NodeVisitor):
         elif isinstance(func, ast.Attribute) and func.attr == "open":
             self._check_open_sensitive(node)
 
+        # W12.3: dict(os.environ) / list(os.environ.items()) — whole-env copy
+        if isinstance(func, ast.Name) and func.id in ("dict", "list"):
+            self._check_environ_containerization(node)
+
         # Main dispatch
         if isinstance(func, ast.Name):
             self._check_simple_call(func.id, node)
@@ -459,6 +478,37 @@ class DangerousNodeVisitor(ast.NodeVisitor):
             self._check_attribute_call(func, node)
 
         self.generic_visit(node)
+
+    def _check_environ_containerization(self, node: ast.Call) -> None:
+        """W12.3: Detect dict(os.environ), list(os.environ.items()), etc.
+
+        Catches whole-environment copy patterns that bypass per-key checks.
+        """
+        if not node.args:
+            return
+        arg = node.args[0]
+
+        # dict(os.environ) or list(os.environ)
+        if self._is_os_environ_expr(arg):
+            self.flags.append("blocked.credential_exfil")
+            return
+
+        # list(os.environ.items()) / list(os.environ.values())
+        if (isinstance(arg, ast.Call) and isinstance(arg.func, ast.Attribute)
+                and arg.func.attr in ("items", "values", "keys")):
+            if self._is_os_environ_expr(arg.func.value):
+                self.flags.append("blocked.credential_exfil")
+
+    def _is_os_environ_expr(self, node: ast.expr) -> bool:
+        """Check if *node* resolves to ``os.environ``."""
+        if isinstance(node, ast.Attribute) and node.attr == "environ":
+            if isinstance(node.value, ast.Name):
+                resolved = self._module_aliases.get(node.value.id, node.value.id)
+                return resolved == "os"
+        if isinstance(node, ast.Name):
+            resolved = self._name_aliases.get(node.id, "")
+            return resolved == "os.environ"
+        return False
 
     def _check_open_sensitive(self, node: ast.Call) -> None:
         """Flag open() calls with sensitive or non-constant paths.

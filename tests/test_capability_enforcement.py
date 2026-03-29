@@ -364,6 +364,15 @@ class TestBackwardCompatibility:
         from openspace.skill_engine.skill_utils import capabilities_need_shell
         assert capabilities_need_shell(frozenset()) is True
 
+    def test_capabilities_need_shell_empty_logs_warning(self) -> None:
+        """M3: fail-open on empty capabilities must emit a warning."""
+        from unittest import mock
+        from openspace.skill_engine.skill_utils import capabilities_need_shell
+        with mock.patch("openspace.skill_engine.skill_utils.logger") as mock_logger:
+            capabilities_need_shell(frozenset())
+            mock_logger.warning.assert_called_once()
+            assert "fail-open" in mock_logger.warning.call_args[0][0]
+
     def test_filter_by_capability_no_params_passes_all(self, tmp_path: Path) -> None:
         """_filter_by_capability with all None params passes everything."""
         content = _skill_md("test", "desc", "subprocess")

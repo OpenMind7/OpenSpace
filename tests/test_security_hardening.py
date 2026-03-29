@@ -133,6 +133,7 @@ class TestSafetyRules:
         """All required blocking flag names must be present in _BLOCKING_FLAGS.
 
         W1 added 3 flags.  W10 added 2 more for fail-closed directory scanning.
+        S1 added unparseable_code for fail-closed on SyntaxError.
         """
         from openspace.skill_engine.skill_utils import _BLOCKING_FLAGS
         required = {
@@ -141,9 +142,50 @@ class TestSafetyRules:
             "blocked.credential_exfil",
             "blocked.unreadable_file",        # W10: fail-closed for unreadable helpers
             "blocked.unreadable_directory",   # W10: fail-closed for unreadable skill dirs
+            "blocked.unparseable_code",       # S1: fail-closed on SyntaxError
         }
         assert required <= _BLOCKING_FLAGS, (
             f"Missing blocking flags: {required - _BLOCKING_FLAGS}"
+        )
+
+    def test_blocking_flags_cover_ast_output(self):
+        """Every flag that ast_safety can produce must be in _BLOCKING_FLAGS.
+
+        M1 sync test: dynamically collects all string literals appended to
+        self.flags in ast_safety.py and verifies _BLOCKING_FLAGS covers them.
+        """
+        import ast as _ast
+        from pathlib import Path
+        from openspace.skill_engine.skill_utils import _BLOCKING_FLAGS
+
+        src = Path(__file__).resolve().parent.parent / "openspace" / "skill_engine" / "ast_safety.py"
+        tree = _ast.parse(src.read_text())
+
+        # Collect all string constants appended via self.flags.append("...")
+        ast_flags: set[str] = set()
+        for node in _ast.walk(tree):
+            if (
+                isinstance(node, _ast.Expr)
+                and isinstance(node.value, _ast.Call)
+                and isinstance(node.value.func, _ast.Attribute)
+                and node.value.func.attr == "append"
+                and len(node.value.args) == 1
+                and isinstance(node.value.args[0], _ast.Constant)
+                and isinstance(node.value.args[0].value, str)
+            ):
+                ast_flags.add(node.value.args[0].value)
+
+        # Also collect from return ["blocked.unparseable_code"] pattern
+        for node in _ast.walk(tree):
+            if isinstance(node, _ast.Return) and isinstance(node.value, _ast.List):
+                for elt in node.value.elts:
+                    if isinstance(elt, _ast.Constant) and isinstance(elt.value, str):
+                        ast_flags.add(elt.value)
+
+        blocking_ast = {f for f in ast_flags if f.startswith("blocked.")}
+        missing = blocking_ast - _BLOCKING_FLAGS
+        assert not missing, (
+            f"ast_safety.py produces flags not in _BLOCKING_FLAGS: {missing}"
         )
 
 
