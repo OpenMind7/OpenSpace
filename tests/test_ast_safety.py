@@ -2046,3 +2046,262 @@ class TestW22GetattrClassAttr:
             'getattr(C.env, m)("PASSWORD")\n'
         )
         assert "blocked.credential_exfil" in check_ast_safety(src)
+
+
+# ===========================================================================
+# W23: Codex W22 findings — 9 fixes (2C + 5H + 1M + 1L)
+# ===========================================================================
+
+
+# ---------------------------------------------------------------------------
+# W23 C1: builtins via class attr (builtins added to _is_dangerous_resolved)
+# ---------------------------------------------------------------------------
+
+class TestW23BuiltinsViaClassAttr:
+    """W23 C1: class C: b = builtins → getattr(C.b, 'eval') must block."""
+
+    def test_class_attr_builtins_eval_blocked(self) -> None:
+        src = (
+            'import builtins\n'
+            'class C:\n'
+            '    b = builtins\n'
+            'getattr(C.b, "eval")("1+1")\n'
+        )
+        assert "blocked.shell_injection" in check_ast_safety(src)
+
+    def test_class_attr_builtins_exec_blocked(self) -> None:
+        src = (
+            'import builtins\n'
+            'class C:\n'
+            '    b = builtins\n'
+            'getattr(C.b, "exec")("pass")\n'
+        )
+        assert "blocked.shell_injection" in check_ast_safety(src)
+
+
+# ---------------------------------------------------------------------------
+# W23 C2: shadowed type metaclass bypass
+# ---------------------------------------------------------------------------
+
+class TestW23ShadowedTypeMetaclass:
+    """W23 C2: type = Evil; class Foo(metaclass=type) must be flagged."""
+
+    def test_shadowed_type_metaclass_blocked(self) -> None:
+        src = (
+            'import os\n'
+            'type = os.system\n'
+            'class Foo(metaclass=type): pass\n'
+        )
+        flags = check_ast_safety(src)
+        assert any("blocked" in f for f in flags)
+
+    def test_unshadowed_type_metaclass_safe(self) -> None:
+        src = 'class Foo(metaclass=type): pass\n'
+        assert check_ast_safety(src) == []
+
+
+# ---------------------------------------------------------------------------
+# W23 H1: Inherited class attrs — derived class inherits base taint
+# ---------------------------------------------------------------------------
+
+class TestW23InheritedClassAttrs:
+    """W23 H1: class Derived(Base) inherits Base.run = os.system taint."""
+
+    def test_inherited_dangerous_attr_blocked(self) -> None:
+        src = (
+            'import os\n'
+            'class Base:\n'
+            '    run = os.system\n'
+            'class Derived(Base): pass\n'
+            'Derived.run("id")\n'
+        )
+        assert "blocked.shell_injection" in check_ast_safety(src)
+
+    def test_inherited_environ_blocked(self) -> None:
+        src = (
+            'import os\n'
+            'class Base:\n'
+            '    env = os.environ\n'
+            'class Child(Base): pass\n'
+            'Child.env.get("SECRET")\n'
+        )
+        assert "blocked.credential_exfil" in check_ast_safety(src)
+
+    def test_no_inheritance_no_taint(self) -> None:
+        src = (
+            'import os\n'
+            'class Base:\n'
+            '    run = os.system\n'
+            'class Unrelated: pass\n'
+            'Unrelated.run("id")\n'
+        )
+        # Unrelated doesn't inherit from Base, so run is not tainted
+        assert check_ast_safety(src) == []
+
+    def test_multi_level_inheritance(self) -> None:
+        src = (
+            'import os\n'
+            'class A:\n'
+            '    cmd = os.system\n'
+            'class B(A): pass\n'
+            'class C(B): pass\n'
+            'C.cmd("id")\n'
+        )
+        assert "blocked.shell_injection" in check_ast_safety(src)
+
+
+# ---------------------------------------------------------------------------
+# W23 H2: from-import reduce/chain aliases route through higher-order check
+# ---------------------------------------------------------------------------
+
+class TestW23FromImportHigherOrder:
+    """W23 H2: from functools import reduce → reduce(os.system, ...) must block."""
+
+    def test_from_import_reduce_blocked(self) -> None:
+        src = (
+            'from functools import reduce\n'
+            'import os\n'
+            'reduce(os.system, ["id"])\n'
+        )
+        assert "blocked.shell_injection" in check_ast_safety(src)
+
+    def test_from_import_reduce_safe(self) -> None:
+        src = (
+            'from functools import reduce\n'
+            'reduce(lambda a, b: a + b, [1, 2, 3])\n'
+        )
+        assert check_ast_safety(src) == []
+
+
+# ---------------------------------------------------------------------------
+# W23 H3: getattr(C.mod, attr) generalized through _check_qualified_call
+# ---------------------------------------------------------------------------
+
+class TestW23GetattrClassModGeneralized:
+    """W23 H3: getattr(C.mod, 'run') routes through _check_qualified_call."""
+
+    def test_getattr_class_subprocess_run_blocked(self) -> None:
+        src = (
+            'import subprocess\n'
+            'class C:\n'
+            '    mod = subprocess\n'
+            'getattr(C.mod, "run")(["id"])\n'
+        )
+        assert "blocked.shell_injection" in check_ast_safety(src)
+
+    def test_getattr_class_shutil_blocked(self) -> None:
+        src = (
+            'import shutil\n'
+            'class C:\n'
+            '    sh = shutil\n'
+            'getattr(C.sh, "rmtree")("/")\n'
+        )
+        flags = check_ast_safety(src)
+        assert any("blocked" in f for f in flags)
+
+
+# ---------------------------------------------------------------------------
+# W23 H4: reduce non-literal iterable — resolve named variables
+# ---------------------------------------------------------------------------
+
+class TestW23ReduceNamedIterable:
+    """W23 H4: functools.reduce(fn, named_var) resolves named collections."""
+
+    def test_reduce_named_dangerous_iterable_blocked(self) -> None:
+        src = (
+            'import functools, os\n'
+            'env = os.environ\n'
+            'functools.reduce(lambda a, k: a, env)\n'
+        )
+        assert "blocked.credential_exfil" in check_ast_safety(src)
+
+    def test_reduce_named_safe_iterable_safe(self) -> None:
+        src = (
+            'import functools\n'
+            'items = [1, 2, 3]\n'
+            'functools.reduce(lambda a, b: a + b, items)\n'
+        )
+        assert check_ast_safety(src) == []
+
+
+# ---------------------------------------------------------------------------
+# W23 H5: getattr(builtins, "open") flagged as evasion
+# ---------------------------------------------------------------------------
+
+class TestW23GetattrBuiltinsOpen:
+    """W23 H5: getattr(builtins, 'open') is evasion for file access."""
+
+    def test_builtins_open_blocked(self) -> None:
+        src = (
+            'import builtins\n'
+            'getattr(builtins, "open")("/etc/passwd")\n'
+        )
+        assert "blocked.shell_injection" in check_ast_safety(src)
+
+    def test_builtins_eval_still_blocked(self) -> None:
+        src = (
+            'import builtins\n'
+            'getattr(builtins, "eval")("1+1")\n'
+        )
+        assert "blocked.shell_injection" in check_ast_safety(src)
+
+
+# ---------------------------------------------------------------------------
+# W23 M1: chain.from_iterable nested recursion
+# ---------------------------------------------------------------------------
+
+class TestW23ChainFromIterableNested:
+    """W23 M1: chain.from_iterable([[os.system]]) must recurse nested lists."""
+
+    def test_nested_list_blocked(self) -> None:
+        src = (
+            'import itertools, os\n'
+            'for f in itertools.chain.from_iterable([[os.system]]):\n'
+            '    f("id")\n'
+        )
+        assert "blocked.shell_injection" in check_ast_safety(src)
+
+    def test_nested_tuple_blocked(self) -> None:
+        src = (
+            'import itertools, os\n'
+            'for f in itertools.chain.from_iterable([(os.system,)]):\n'
+            '    f("id")\n'
+        )
+        assert "blocked.shell_injection" in check_ast_safety(src)
+
+    def test_flat_still_works(self) -> None:
+        src = (
+            'import itertools, os\n'
+            'for f in itertools.chain.from_iterable([os.system]):\n'
+            '    f("id")\n'
+        )
+        assert "blocked.shell_injection" in check_ast_safety(src)
+
+
+# ---------------------------------------------------------------------------
+# W23 L1: safe builtins negative test
+# ---------------------------------------------------------------------------
+
+class TestW23SafeBuiltinsNegative:
+    """W23 L1: getattr(builtins, 'len') should NOT be flagged."""
+
+    def test_builtins_len_safe(self) -> None:
+        src = (
+            'import builtins\n'
+            'getattr(builtins, "len")([1, 2, 3])\n'
+        )
+        assert check_ast_safety(src) == []
+
+    def test_builtins_print_safe(self) -> None:
+        src = (
+            'import builtins\n'
+            'getattr(builtins, "print")("hello")\n'
+        )
+        assert check_ast_safety(src) == []
+
+    def test_builtins_int_safe(self) -> None:
+        src = (
+            'import builtins\n'
+            'getattr(builtins, "int")("42")\n'
+        )
+        assert check_ast_safety(src) == []

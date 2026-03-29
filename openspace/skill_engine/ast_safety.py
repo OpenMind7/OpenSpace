@@ -344,6 +344,13 @@ class DangerousNodeVisitor(ast.NodeVisitor):
                             if elt_resolved is not None and self._is_dangerous_resolved(elt_resolved):
                                 self._propagate_taint_target(target, elt)
                                 return
+                            # W23 M1: Recurse into nested List/Tuple for from_iterable
+                            if isinstance(elt, (ast.List, ast.Tuple)):
+                                for nested_elt in elt.elts:
+                                    nested_resolved = self._peel_to_resolve(nested_elt)
+                                    if nested_resolved is not None and self._is_dangerous_resolved(nested_resolved):
+                                        self._propagate_taint_target(target, nested_elt)
+                                        return
 
     def visit_With(self, node: ast.With) -> None:
         """Track with-statement taint: ``with open(...) as f: ...``"""
@@ -411,6 +418,25 @@ class DangerousNodeVisitor(ast.NodeVisitor):
                         qual = f"{class_name}.{stmt.target.id}"
                         self._name_aliases[qual] = resolved
                         self._class_attr_taint[qual] = resolved
+        # W23 H1: Inherited class attrs — copy base class taint to derived class
+        for base in node.bases:
+            base_name: Optional[str] = None
+            if isinstance(base, ast.Name):
+                base_name = base.id
+            elif isinstance(base, ast.Attribute):
+                base_name = self._resolve_attribute_chain(base)
+            if base_name is not None:
+                # Resolve through aliases (from X import Y as Z)
+                if base_name in self._name_aliases:
+                    base_name = self._name_aliases[base_name]
+                prefix = f"{base_name}."
+                for key, value in list(self._class_attr_taint.items()):
+                    if key.startswith(prefix):
+                        attr_part = key[len(prefix):]
+                        derived_key = f"{class_name}.{attr_part}"
+                        if derived_key not in self._class_attr_taint:
+                            self._class_attr_taint[derived_key] = value
+                            self._name_aliases[derived_key] = value
         self.generic_visit(node)
 
     @staticmethod
@@ -443,9 +469,12 @@ class DangerousNodeVisitor(ast.NodeVisitor):
             mc = kw.value
             # Direct Name: metaclass=type, metaclass=ABCMeta
             if isinstance(mc, ast.Name):
-                # "type" is always safe (builtin, cannot be shadowed via import)
+                # "type" is safe only if not shadowed by a local assignment
+                # W23 C2: type = Evil; class Foo(metaclass=type) must be blocked
                 if mc.id == "type":
-                    return  # safe
+                    if mc.id not in self._name_aliases and mc.id not in self._module_aliases:
+                        return  # genuine builtin type — safe
+                    # Shadowed — fall through to flag
                 # For other names, verify import provenance
                 resolved = self._module_aliases.get(mc.id) or self._name_aliases.get(mc.id)
                 if resolved and resolved in _SAFE_METACLASS_FQN:
@@ -743,6 +772,15 @@ class DangerousNodeVisitor(ast.NodeVisitor):
                 )
                 if taint is not None:
                     return taint
+            # W23 L1: For getattr(mod, "attr") calls, resolve as "mod.attr"
+            # instead of just the first arg — prevents false positives on safe attrs
+            if callee_name == "getattr" and len(node.args) >= 2:
+                first_resolved = self._peel_to_resolve(node.args[0])
+                attr_str = _get_constant_arg(node, 1)
+                if first_resolved is not None and attr_str is not None:
+                    return f"{first_resolved}.{attr_str}"
+                # Dynamic attr — return module (fail-closed)
+                return first_resolved
             # Existing W17 C1: try to resolve first positional argument
             if node.args:
                 return self._peel_to_resolve(node.args[0])
@@ -836,7 +874,7 @@ class DangerousNodeVisitor(ast.NodeVisitor):
             if root in _ALL_DANGEROUS_MODULES:
                 return True
         else:
-            if resolved in _ALL_DANGEROUS_MODULES or resolved in {"os", "sys"}:
+            if resolved in _ALL_DANGEROUS_MODULES or resolved in {"os", "sys", "builtins"}:
                 return True
         return False
 
@@ -1130,6 +1168,8 @@ class DangerousNodeVisitor(ast.NodeVisitor):
         # Check if this name is an alias for a dangerous function
         if name in self._name_aliases:
             qualified = self._name_aliases[name]
+            # W23 H2: Check higher-order functions via from-import aliases
+            self._check_higher_order_call(qualified, node)
             self._check_qualified_call(qualified)
 
     def _check_attribute_call(self, func: ast.Attribute, node: ast.Call) -> None:
@@ -1210,6 +1250,12 @@ class DangerousNodeVisitor(ast.NodeVisitor):
                     if elt_resolved is not None and self._is_dangerous_resolved(elt_resolved):
                         self.flags.append(self._flag_for_resolved(elt_resolved))
                         return
+            else:
+                # W23 H4: Resolve named collections (variables holding dangerous refs)
+                resolved = self._peel_to_resolve(iterable_arg)
+                if resolved is not None and self._is_dangerous_resolved(resolved):
+                    self.flags.append(self._flag_for_resolved(resolved))
+                    return
             fn_resolved = self._peel_to_resolve(node.args[0])
             if fn_resolved is not None and self._is_dangerous_resolved(fn_resolved):
                 self.flags.append(self._flag_for_resolved(fn_resolved))
@@ -1370,7 +1416,8 @@ class DangerousNodeVisitor(ast.NodeVisitor):
             if attr_arg is None:
                 # Dynamic attr name — fail-closed
                 self.flags.append("blocked.shell_injection")
-            elif attr_arg in _BLANKET_BLOCKED_BUILTINS or attr_arg == "__import__":
+            elif attr_arg in _BLANKET_BLOCKED_BUILTINS or attr_arg in ("__import__", "open"):
+                # W23 H5: getattr(builtins, "open") is evasion for file access
                 self.flags.append("blocked.shell_injection")
             return
 
@@ -1383,10 +1430,10 @@ class DangerousNodeVisitor(ast.NodeVisitor):
                     self.flags.append("blocked.credential_exfil")
                 else:
                     self.flags.append("blocked.shell_injection")
-            elif "environ" in taint_source and attr_arg in _DANGEROUS_OS_ENVIRON_METHODS:
-                self.flags.append("blocked.credential_exfil")
-            elif attr_arg in _DANGEROUS_OS_FUNCS:
-                self.flags.append("blocked.shell_injection")
+            else:
+                # W23 H3: Route through _check_qualified_call for general resolution
+                synthetic_qual = f"{taint_source}.{attr_arg}"
+                self._check_qualified_call(synthetic_qual)
             return
 
         if resolved_mod in _ALL_DANGEROUS_MODULES or resolved_mod == "os":
