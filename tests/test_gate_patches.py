@@ -253,3 +253,65 @@ class TestSafetyAndCapabilitiesIntegration:
         )
         flags = check_skill_safety(content)
         assert not is_skill_safe(flags)
+
+
+# ── W18: Frontmatter duplicate key consistency ─────────────────────────
+
+
+class TestFrontmatterDuplicateKeys:
+    """W18: parse_frontmatter and get_frontmatter_field must both use
+    first-wins semantics.  Duplicate keys are logged as warnings.
+
+    Before W18, parse_frontmatter was last-wins and get_frontmatter_field
+    was first-wins, creating a semantic gap an attacker could exploit.
+    """
+
+    def test_parse_frontmatter_first_wins(self):
+        """Duplicate key → first occurrence kept."""
+        from openspace.skill_engine.skill_utils import parse_frontmatter
+        content = "---\nname: safe-skill\nname: evil-injection\n---\nBody"
+        fm = parse_frontmatter(content)
+        assert fm["name"] == "safe-skill"
+
+    def test_get_frontmatter_field_first_wins(self):
+        """get_frontmatter_field also returns first occurrence (was already correct)."""
+        from openspace.skill_engine.skill_utils import get_frontmatter_field
+        content = "---\nname: safe-skill\nname: evil-injection\n---\nBody"
+        assert get_frontmatter_field(content, "name") == "safe-skill"
+
+    def test_consistency_between_parsers(self):
+        """Both functions must return the same value for the same key."""
+        from openspace.skill_engine.skill_utils import parse_frontmatter, get_frontmatter_field
+        content = "---\nname: correct\ndescription: first\nname: spoofed\ndescription: second\n---\nBody"
+        fm = parse_frontmatter(content)
+        assert fm["name"] == get_frontmatter_field(content, "name")
+        assert fm["description"] == get_frontmatter_field(content, "description")
+
+    def test_duplicate_logs_warning(self):
+        """Duplicate keys must emit a warning (possible injection)."""
+        from unittest import mock
+        from openspace.skill_engine.skill_utils import parse_frontmatter
+        content = "---\nname: safe\nname: evil\n---\nBody"
+        with mock.patch("openspace.skill_engine.skill_utils.logger") as mock_logger:
+            fm = parse_frontmatter(content)
+            mock_logger.warning.assert_called_once()
+            assert "Duplicate" in mock_logger.warning.call_args[0][0]
+
+    def test_no_duplicates_no_warning(self):
+        """Normal frontmatter without duplicates → no warning."""
+        from unittest import mock
+        from openspace.skill_engine.skill_utils import parse_frontmatter
+        content = "---\nname: safe\ndescription: desc\n---\nBody"
+        with mock.patch("openspace.skill_engine.skill_utils.logger") as mock_logger:
+            fm = parse_frontmatter(content)
+            mock_logger.warning.assert_not_called()
+
+    def test_triple_duplicate_keeps_first(self):
+        """Three occurrences of same key → first wins, two warnings."""
+        from unittest import mock
+        from openspace.skill_engine.skill_utils import parse_frontmatter
+        content = "---\nname: first\nname: second\nname: third\n---\nBody"
+        with mock.patch("openspace.skill_engine.skill_utils.logger") as mock_logger:
+            fm = parse_frontmatter(content)
+            assert fm["name"] == "first"
+            assert mock_logger.warning.call_count == 2

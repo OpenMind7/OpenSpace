@@ -37,6 +37,7 @@ from .skill_utils import (
     check_skill_safety,
     check_skill_directory_safety,
     is_skill_safe,
+    validate_capability_manifest,
 )
 from .skill_ranker import SkillRanker, SkillCandidate, PREFILTER_THRESHOLD
 
@@ -171,6 +172,15 @@ class SkillRegistry:
                         )
                         continue
 
+                    # W18: Fail-closed capability validation — typos in capability
+                    # names would silently grant excess permissions.
+                    cap_error = validate_capability_manifest(content)
+                    if cap_error:
+                        logger.warning(
+                            f"BLOCKED skill {entry.name}: {cap_error}"
+                        )
+                        continue
+
                     meta = self._parse_skill(entry.name, entry, skill_file, content)
                     sid = meta.skill_id
 
@@ -291,6 +301,14 @@ class SkillRegistry:
                         )
                         continue
 
+                    # W18: Fail-closed capability validation
+                    cap_error = validate_capability_manifest(content)
+                    if cap_error:
+                        logger.warning(
+                            f"BLOCKED external skill {entry.name}: {cap_error}"
+                        )
+                        continue
+
                     meta = self._parse_skill(entry.name, entry, skill_file, content)
                     if meta.skill_id in self._skills:
                         continue
@@ -333,6 +351,14 @@ class SkillRegistry:
                 logger.warning(
                     f"BLOCKED skill {skill_dir.name}: "
                     f"safety flags {safety_flags}"
+                )
+                return None
+
+            # W18: Fail-closed capability validation
+            cap_error = validate_capability_manifest(content)
+            if cap_error:
+                logger.warning(
+                    f"BLOCKED skill {skill_dir.name}: {cap_error}"
                 )
                 return None
 

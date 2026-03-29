@@ -377,3 +377,97 @@ class TestCondaEnvValidation:
         """W15.2: Null byte in conda env name must be rejected."""
         with pytest.raises(ValueError):
             validate_conda_env("myenv\x00")
+
+
+# ---------------------------------------------------------------------------
+# W18: validate_conda_env type guard
+# ---------------------------------------------------------------------------
+
+class TestCondaEnvTypeGuard:
+    """W18: validate_conda_env must reject non-string types with TypeError."""
+
+    def test_int_raises_type_error(self):
+        with pytest.raises(TypeError, match="must be str"):
+            validate_conda_env(123)
+
+    def test_list_raises_type_error(self):
+        with pytest.raises(TypeError, match="must be str"):
+            validate_conda_env(["myenv"])
+
+    def test_dict_raises_type_error(self):
+        with pytest.raises(TypeError, match="must be str"):
+            validate_conda_env({"name": "myenv"})
+
+    def test_bool_raises_type_error(self):
+        """bool is a subclass of int in Python — must still reject."""
+        with pytest.raises(TypeError, match="must be str"):
+            validate_conda_env(True)
+
+    def test_bytes_raises_type_error(self):
+        with pytest.raises(TypeError, match="must be str"):
+            validate_conda_env(b"myenv")
+
+    def test_none_returns_none(self):
+        """None should still return None (not TypeError)."""
+        assert validate_conda_env(None) is None
+
+    def test_empty_string_returns_none(self):
+        """Empty string should still return None (not TypeError)."""
+        assert validate_conda_env("") is None
+
+    def test_valid_string_passes(self):
+        """Normal string should still work."""
+        assert validate_conda_env("myenv") == "myenv"
+
+
+# ---------------------------------------------------------------------------
+# W18: RLIMIT fail-open telemetry
+# ---------------------------------------------------------------------------
+
+class TestRlimitTelemetry:
+    """W18: RLIMIT preambles must emit warnings when limits fail to apply,
+    instead of silently passing (fail-open telemetry gap)."""
+
+    def test_bash_preamble_has_failure_warnings(self):
+        """Bash preamble must log when ulimit fails."""
+        assert "WARN" in BASH_RLIMIT_PREAMBLE
+        # Each ulimit line should have a failure handler
+        assert "CPU time limit not enforced" in BASH_RLIMIT_PREAMBLE
+        assert "virtual memory limit not enforced" in BASH_RLIMIT_PREAMBLE
+        assert "file size limit not enforced" in BASH_RLIMIT_PREAMBLE
+        assert "file descriptor limit not enforced" in BASH_RLIMIT_PREAMBLE
+
+    def test_bash_preamble_warnings_go_to_stderr(self):
+        """Warnings must go to stderr, not stdout (to not corrupt script output)."""
+        for line in BASH_RLIMIT_PREAMBLE.split("\n"):
+            if "WARN" in line:
+                assert ">&2" in line, f"Warning not redirected to stderr: {line}"
+
+    def test_python_preamble_has_failure_warnings(self):
+        """Python preamble must log when setrlimit fails."""
+        assert "WARN" in PYTHON_RLIMIT_PREAMBLE
+        assert "setrlimit" in PYTHON_RLIMIT_PREAMBLE
+        assert "stderr" in PYTHON_RLIMIT_PREAMBLE
+
+    def test_python_preamble_no_silent_pass(self):
+        """Python preamble must NOT have bare 'pass' in except blocks."""
+        # Check that no except block has a bare 'pass' (old fail-open pattern)
+        lines = PYTHON_RLIMIT_PREAMBLE.split("\n")
+        for i, line in enumerate(lines):
+            stripped = line.strip()
+            if stripped == "pass":
+                # Check if prev line is an except — that's the fail-open pattern
+                if i > 0 and "except" in lines[i - 1]:
+                    pytest.fail(
+                        f"Silent 'pass' in except block at line {i}: "
+                        f"{lines[i-1].strip()} / {stripped}"
+                    )
+
+    def test_python_preamble_still_compiles(self):
+        """Preamble must still be valid Python after telemetry changes."""
+        compile(PYTHON_RLIMIT_PREAMBLE, "<preamble>", "exec")
+
+    def test_python_preamble_cleans_up_all_names(self):
+        """Preamble must still delete temp names after telemetry additions."""
+        assert "del _os_rlimit" in PYTHON_RLIMIT_PREAMBLE
+        assert "del" in PYTHON_RLIMIT_PREAMBLE

@@ -26,6 +26,7 @@ from openspace.skill_engine.skill_utils import (
     CAPABILITY_TO_BACKENDS,
     VALID_CAPABILITIES,
     parse_capabilities,
+    validate_capability_manifest,
 )
 from openspace.skill_engine.registry import SkillMeta, SkillRegistry
 
@@ -511,3 +512,98 @@ class TestFilterToolsByCapabilities:
         result = allowed_backends_for_capabilities(frozenset({"subprocess"}))
         assert result is not None
         assert "system" in result
+
+
+# ---------------------------------------------------------------------------
+# Group 8: W18 — Capability manifest fail-closed validation
+# ---------------------------------------------------------------------------
+
+
+class TestCapabilityManifestFailClosed:
+    """W18: Unknown capabilities must block the skill (fail-closed),
+    not silently grant excess permissions (fail-open)."""
+
+    def test_valid_capabilities_pass(self) -> None:
+        """All valid capabilities → no error."""
+        content = _skill_md("ok_skill", "desc", "network,subprocess")
+        assert validate_capability_manifest(content) is None
+
+    def test_no_capabilities_pass(self) -> None:
+        """Legacy skill without capabilities field → no error."""
+        content = _skill_md("legacy", "desc", "")
+        assert validate_capability_manifest(content) is None
+
+    def test_typo_capability_returns_error(self) -> None:
+        """Typo like 'netwerk' must return error string, not silently pass."""
+        content = _skill_md("typo_skill", "desc", "netwerk,subprocess")
+        error = validate_capability_manifest(content)
+        assert error is not None
+        assert "netwerk" in error
+
+    def test_all_unknown_capabilities_returns_error(self) -> None:
+        """Fully bogus capabilities must return error."""
+        content = _skill_md("bogus", "desc", "foo,bar,baz")
+        error = validate_capability_manifest(content)
+        assert error is not None
+        assert "foo" in error
+
+    def test_single_unknown_among_valid_returns_error(self) -> None:
+        """Even one unknown capability → error (fail-closed)."""
+        content = _skill_md("mixed", "desc", "network,filesystm")
+        error = validate_capability_manifest(content)
+        assert error is not None
+        assert "filesystm" in error
+
+    def test_empty_capabilities_field_passes(self) -> None:
+        """Empty capabilities: field → no error (same as absent)."""
+        content = "---\nname: empty\ndescription: desc\ncapabilities:\n---\n# Skill"
+        assert validate_capability_manifest(content) is None
+
+    def test_discover_blocks_typo_capability(self, tmp_path: Path) -> None:
+        """Registry.discover() must skip skills with unknown capabilities."""
+        skill_dir = _make_skill_dir(
+            tmp_path,
+            "typo_skill",
+            _skill_md("typo_skill", "Has typo cap", "netwerk,subprocess"),
+        )
+        registry = SkillRegistry(skill_dirs=[tmp_path])
+        skills = registry.discover()
+        # Should be blocked — not in registry
+        assert not any(s.name == "typo_skill" for s in skills)
+
+    def test_discover_allows_valid_capability(self, tmp_path: Path) -> None:
+        """Registry.discover() must allow skills with valid capabilities."""
+        skill_dir = _make_skill_dir(
+            tmp_path,
+            "valid_skill",
+            _skill_md("valid_skill", "Has valid cap", "network,subprocess"),
+        )
+        registry = SkillRegistry(skill_dirs=[tmp_path])
+        skills = registry.discover()
+        assert any(s.name == "valid_skill" for s in skills)
+
+    def test_register_skill_dir_blocks_typo(self, tmp_path: Path) -> None:
+        """register_skill_dir must return None for typo capabilities."""
+        skill_dir = tmp_path / "typo_skill"
+        skill_dir.mkdir()
+        (skill_dir / "SKILL.md").write_text(
+            _skill_md("typo_skill", "desc", "suprocess"),  # typo
+            encoding="utf-8",
+        )
+        registry = SkillRegistry(skill_dirs=[tmp_path])
+        result = registry.register_skill_dir(skill_dir)
+        assert result is None
+
+    def test_discover_from_dirs_blocks_typo(self, tmp_path: Path) -> None:
+        """discover_from_dirs must skip skills with unknown capabilities."""
+        extra = tmp_path / "extra"
+        extra.mkdir()
+        skill_dir = extra / "typo_skill"
+        skill_dir.mkdir()
+        (skill_dir / "SKILL.md").write_text(
+            _skill_md("typo_skill", "desc", "gpu,clod_api"),  # typo
+            encoding="utf-8",
+        )
+        registry = SkillRegistry(skill_dirs=[])
+        added = registry.discover_from_dirs([extra])
+        assert not any(s.name == "typo_skill" for s in added)

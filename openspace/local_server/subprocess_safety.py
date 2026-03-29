@@ -83,9 +83,16 @@ _CONDA_ENV_RE = re.compile(r'[a-zA-Z0-9][a-zA-Z0-9._-]*')
 def validate_conda_env(conda_env: Optional[str]) -> Optional[str]:
     """Validate conda environment name against shell injection.
 
-    Returns the validated name, or None if empty.
+    Returns the validated name, or None if empty/None.
     Raises ValueError if the name contains injection characters.
+    Raises TypeError if *conda_env* is not a string.
     """
+    if conda_env is None:
+        return None
+    if not isinstance(conda_env, str):
+        raise TypeError(
+            f"conda_env must be str or None, got {type(conda_env).__name__}"
+        )
     if not conda_env:
         return None
     if len(conda_env) > 128:
@@ -184,16 +191,17 @@ def create_secure_temp_file(
 
 BASH_RLIMIT_PREAMBLE = """\
 # --- OpenSpace resource limits ---
-ulimit -t 300 2>/dev/null    # CPU time (seconds)
-ulimit -v 2097152 2>/dev/null  # Virtual memory (KB) — 2 GB
-ulimit -f 512000 2>/dev/null   # Max file size (KB blocks) — 500 MB
-ulimit -n 1024 2>/dev/null     # Open file descriptors
+ulimit -t 300 2>/dev/null || echo "[openspace:rlimit] WARN: CPU time limit not enforced" >&2
+ulimit -v 2097152 2>/dev/null || echo "[openspace:rlimit] WARN: virtual memory limit not enforced" >&2
+ulimit -f 512000 2>/dev/null || echo "[openspace:rlimit] WARN: file size limit not enforced" >&2
+ulimit -n 1024 2>/dev/null || echo "[openspace:rlimit] WARN: file descriptor limit not enforced" >&2
 # --- end resource limits ---
 """
 
 PYTHON_RLIMIT_PREAMBLE = """\
 # --- OpenSpace resource limits ---
 import resource as _os_rlimit
+import sys as _os_sys
 for _res, _lim in [
     (_os_rlimit.RLIMIT_CPU, (300, 300)),
     (_os_rlimit.RLIMIT_FSIZE, (500 * 1024 * 1024, 500 * 1024 * 1024)),
@@ -201,15 +209,14 @@ for _res, _lim in [
 ]:
     try:
         _os_rlimit.setrlimit(_res, _lim)
-    except (ValueError, OSError):
-        pass
+    except (ValueError, OSError) as _os_e:
+        print(f"[openspace:rlimit] WARN: setrlimit({_res}) failed: {_os_e}", file=_os_sys.stderr)
 # RLIMIT_AS is unsupported on macOS — only set on Linux
-import sys as _os_sys
 if _os_sys.platform == "linux":
     try:
         _os_rlimit.setrlimit(_os_rlimit.RLIMIT_AS, (2 * 1024**3, 2 * 1024**3))
-    except (ValueError, OSError):
-        pass
+    except (ValueError, OSError) as _os_e:
+        print(f"[openspace:rlimit] WARN: setrlimit(RLIMIT_AS) failed: {_os_e}", file=_os_sys.stderr)
 del _os_rlimit, _os_sys, _res, _lim
 # --- end resource limits ---
 """

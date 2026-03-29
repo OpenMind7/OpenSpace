@@ -180,6 +180,11 @@ def parse_frontmatter(content: str) -> Dict[str, Any]:
     Simple line-by-line parser (no PyYAML dependency).
     Handles both quoted and unquoted values.
     Returns ``{}`` if no valid frontmatter is found.
+
+    **First-wins semantics**: if a key appears more than once, only the
+    first occurrence is kept (consistent with :func:`get_frontmatter_field`).
+    Duplicates are logged as a warning — they may indicate an injection
+    attempt where the attacker hopes the second value overrides the first.
     """
     if not content.startswith("---"):
         return {}
@@ -192,6 +197,13 @@ def parse_frontmatter(content: str) -> Dict[str, Any]:
             key, value = line.split(":", 1)
             key = key.strip()
             if key:
+                if key in fm:
+                    logger.warning(
+                        "Duplicate frontmatter key '%s' — keeping first occurrence "
+                        "(possible injection attempt)",
+                        key,
+                    )
+                    continue  # first-wins, consistent with get_frontmatter_field
                 fm[key] = _yaml_unquote(value.strip())
     return fm
 
@@ -447,7 +459,8 @@ def parse_capabilities(content: str) -> frozenset[str]:
         capabilities: network,filesystem,subprocess
 
     Returns a frozenset of validated capability names.
-    Unknown capabilities are logged and ignored.
+    Unknown capabilities are logged and ignored for backward compatibility.
+    Use :func:`validate_capability_manifest` for strict (fail-closed) validation.
     """
     raw = get_frontmatter_field(content, "capabilities")
     if not raw:
@@ -457,6 +470,33 @@ def parse_capabilities(content: str) -> frozenset[str]:
     if invalid:
         logger.warning("Unknown capabilities ignored: %s", invalid)
     return caps & VALID_CAPABILITIES
+
+
+def validate_capability_manifest(content: str) -> Optional[str]:
+    """Validate the ``capabilities`` field in SKILL.md frontmatter (fail-closed).
+
+    Returns ``None`` if valid (or absent — legacy skills are OK).
+    Returns an error message string if any declared capability is unknown,
+    which likely indicates a typo that would silently grant excess permissions.
+
+    W18: Fixes the fail-open gap where typos like ``netwerk`` instead of
+    ``network`` were silently ignored, causing the skill to run without
+    the intended capability restriction.
+    """
+    raw = get_frontmatter_field(content, "capabilities")
+    if not raw:
+        return None  # no capabilities declared = legacy, OK
+    caps = frozenset(c.strip().lower() for c in raw.split(",") if c.strip())
+    if not caps:
+        return None  # empty after stripping = same as absent
+    invalid = caps - VALID_CAPABILITIES
+    if invalid:
+        return (
+            f"Unknown capabilities declared: {sorted(invalid)} — "
+            f"valid capabilities are: {sorted(VALID_CAPABILITIES)}. "
+            f"Fix typos or the skill will be blocked (fail-closed)."
+        )
+    return None
 
 
 def check_capability_violations(
