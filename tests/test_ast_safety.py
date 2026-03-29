@@ -965,3 +965,160 @@ class TestW16LowStaleTaintRebind:
         src = "import os\nx = os.environ\nx = 42\nx.get('KEY')"
         flags = check_ast_safety(src)
         assert "blocked.credential_exfil" not in flags
+
+
+# ---------------------------------------------------------------------------
+# W17: Codex-found bypass fixes — 4 CRIT + 4 HIGH
+# ---------------------------------------------------------------------------
+
+
+class TestW17CritNestedLambdaClosure:
+    """W17 C1: Nested lambda/closure return values must propagate taint."""
+
+    def test_nested_closure_os_system(self) -> None:
+        src = 'import os\nf = (lambda y: (lambda: y))(os.system)\nf()("id")'
+        assert "blocked.shell_injection" in check_ast_safety(src)
+
+    def test_lambda_identity_wrap(self) -> None:
+        src = "import subprocess\nsp = (lambda x: x)(subprocess)\nsp.run(['ls'])"
+        assert "blocked.shell_injection" in check_ast_safety(src)
+
+    def test_staticmethod_wrap_then_call(self) -> None:
+        src = "import os\nf = staticmethod(os.system)\nf('id')"
+        assert "blocked.shell_injection" in check_ast_safety(src)
+
+
+class TestW17CritAttrSmuggling:
+    """W17 C2: __init_subclass__ / __set_name__ attribute smuggling."""
+
+    def test_init_subclass_smuggle(self) -> None:
+        src = (
+            "import os\n"
+            "class B:\n"
+            "    def __init_subclass__(cls):\n"
+            "        cls.pwn = staticmethod(os.system)\n"
+            "class C(B):\n"
+            "    pass\n"
+            "C.pwn('id')"
+        )
+        assert "blocked.shell_injection" in check_ast_safety(src)
+
+    def test_set_name_smuggle(self) -> None:
+        src = (
+            "import os\n"
+            "class D:\n"
+            "    def __set_name__(self, owner, name):\n"
+            "        self.pwn = os.system\n"
+            "d = D()\n"
+            "d.pwn('id')"
+        )
+        assert "blocked.shell_injection" in check_ast_safety(src)
+
+    def test_self_attr_assign_subprocess(self) -> None:
+        src = "import subprocess\nclass C:\n    def m(self):\n        self.run = subprocess.call"
+        assert "blocked.shell_injection" in check_ast_safety(src)
+
+
+class TestW17CritDynamicClassType:
+    """W17 C3: type() with 3 args and dangerous dict values."""
+
+    def test_type_dynamic_class(self) -> None:
+        src = 'import os\nC = type("C", (), {"run": staticmethod(os.system)})\nC.run("id")'
+        assert "blocked.shell_injection" in check_ast_safety(src)
+
+    def test_type_subprocess_in_dict(self) -> None:
+        src = 'import subprocess\nC = type("C", (), {"go": subprocess.run})'
+        assert "blocked.shell_injection" in check_ast_safety(src)
+
+    def test_type_safe_dict(self) -> None:
+        src = 'C = type("C", (), {"x": 42})'
+        assert check_ast_safety(src) == []
+
+
+class TestW17CritDecoratorRebinding:
+    """W17 C4: Decorator that returns dangerous callable taints decorated name."""
+
+    def test_decorator_returns_os_system(self) -> None:
+        src = (
+            "import os\n"
+            "def dec(f):\n"
+            "    return os.system\n"
+            "@dec\n"
+            "def run(cmd):\n"
+            "    return cmd\n"
+            "run('id')"
+        )
+        assert "blocked.shell_injection" in check_ast_safety(src)
+
+    def test_decorator_returns_subprocess(self) -> None:
+        src = (
+            "import subprocess\n"
+            "def wrap(f):\n"
+            "    return subprocess.call\n"
+            "@wrap\n"
+            "def execute(cmd):\n"
+            "    pass\n"
+            "execute(['ls'])"
+        )
+        assert "blocked.shell_injection" in check_ast_safety(src)
+
+    def test_safe_decorator(self) -> None:
+        src = "def dec(f):\n    return f\n@dec\ndef run():\n    pass\nrun()"
+        assert check_ast_safety(src) == []
+
+
+class TestW17HighStarredDestructuring:
+    """W17 H1: Starred destructuring must propagate taint."""
+
+    def test_starred_os(self) -> None:
+        src = "import os\n*a, b = [os, 1]\na.system('id')"
+        assert "blocked.shell_injection" in check_ast_safety(src)
+
+    def test_starred_mixed_dangerous(self) -> None:
+        src = "import subprocess\na, *rest = [1, subprocess]\nrest[0].run(['ls'])"
+        # rest is tainted as subprocess by conservative propagation
+        assert "blocked.shell_injection" in check_ast_safety(src)
+
+
+class TestW17HighMultiElementFor:
+    """W17 H2: Multi-element for/async for and positional-only defaults."""
+
+    def test_for_multi_element(self) -> None:
+        src = "import os\nfor x in [1, os.environ]:\n    x.get('PASSWORD')"
+        assert "blocked.credential_exfil" in check_ast_safety(src)
+
+    def test_posonly_default(self) -> None:
+        src = "import os\ndef f(env=os.environ, /):\n    env.get('PASSWORD')"
+        assert "blocked.credential_exfil" in check_ast_safety(src)
+
+    def test_for_single_still_works(self) -> None:
+        src = "import os\nfor env in [os.environ]:\n    env.get('PASSWORD')"
+        assert "blocked.credential_exfil" in check_ast_safety(src)
+
+
+class TestW17HighDictSubscriptPeel:
+    """W17 H3: _peel_to_resolve handles dict-literal subscript wrappers."""
+
+    def test_dict_subscript_environ(self) -> None:
+        src = 'import os\n{"k": os.environ}["k"].get("PASSWORD")'
+        assert "blocked.credential_exfil" in check_ast_safety(src)
+
+    def test_dict_subscript_subprocess(self) -> None:
+        src = 'import subprocess\n{"sp": subprocess}["sp"].run(["ls"])'
+        assert "blocked.shell_injection" in check_ast_safety(src)
+
+
+class TestW17HighStringConcatDunder:
+    """W17 H4: Dynamic dunder via string concatenation in getattr."""
+
+    def test_concat_globals(self) -> None:
+        src = 'getattr(object, "__" + "globals__")'
+        assert "blocked.shell_injection" in check_ast_safety(src)
+
+    def test_concat_subclasses(self) -> None:
+        src = 'getattr(object, "__" + "subclasses__")'
+        assert "blocked.shell_injection" in check_ast_safety(src)
+
+    def test_concat_safe(self) -> None:
+        src = 'getattr(object, "__" + "str__")'
+        assert check_ast_safety(src) == []

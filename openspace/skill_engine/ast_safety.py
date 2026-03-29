@@ -188,6 +188,9 @@ class DangerousNodeVisitor(ast.NodeVisitor):
         self._module_aliases: Dict[str, str] = {}
         # Track name aliases: alias_name -> "module.name" or just "name"
         self._name_aliases: Dict[str, str] = {}
+        # W17 C4: Track function return taint for decorator analysis
+        # func_name -> resolved dangerous return value
+        self._func_return_taint: Dict[str, str] = {}
 
     # --- Import tracking + assignment taint ---
 
@@ -217,9 +220,12 @@ class DangerousNodeVisitor(ast.NodeVisitor):
         W16 CRIT-2: Handles chained assignment (a = b = subprocess) by
         iterating ALL targets, and destructuring ((a, b) = ...) by recursing
         into Tuple/List/Starred leaves.
+        W17 C2: Also detects dangerous attribute assignments (cls.attr = os.system).
         """
         for target in node.targets:
             self._propagate_taint_target(target, node.value)
+            # W17 C2: Flag attribute assignments where value is dangerous
+            self._check_dangerous_attr_assign(target, node.value)
         self.generic_visit(node)
 
     def visit_AnnAssign(self, node: ast.AnnAssign) -> None:
@@ -238,20 +244,19 @@ class DangerousNodeVisitor(ast.NodeVisitor):
     def visit_For(self, node: ast.For) -> None:
         """Track for-loop taint: ``for env in [os.environ]: ...``
 
-        If the iter is a list/tuple/set literal with ONE element, propagate.
+        W17 H2: Propagate taint from ALL elements of literal iterables,
+        not just single-element ones.
         """
         if isinstance(node.iter, (ast.List, ast.Tuple, ast.Set)):
-            elts = node.iter.elts
-            if len(elts) == 1:
-                self._propagate_taint_target(node.target, elts[0])
+            for elt in node.iter.elts:
+                self._propagate_taint_target(node.target, elt)
         self.generic_visit(node)
 
     def visit_AsyncFor(self, node: ast.AsyncFor) -> None:
         """Same as visit_For for async for loops."""
         if isinstance(node.iter, (ast.List, ast.Tuple, ast.Set)):
-            elts = node.iter.elts
-            if len(elts) == 1:
-                self._propagate_taint_target(node.target, elts[0])
+            for elt in node.iter.elts:
+                self._propagate_taint_target(node.target, elt)
         self.generic_visit(node)
 
     def visit_With(self, node: ast.With) -> None:
@@ -269,24 +274,36 @@ class DangerousNodeVisitor(ast.NodeVisitor):
         self.generic_visit(node)
 
     def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
-        """Track dangerous default arguments: ``def f(env=os.environ): ...``"""
+        """Track dangerous default arguments and decorator return taint.
+
+        W17 C4: Records function return taint and applies decorator rebinding.
+        """
         self._propagate_default_args(node)
+        self._scan_function_returns(node)
+        self._check_decorator_taint(node)
         self.generic_visit(node)
 
     def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef) -> None:
         """Same as visit_FunctionDef for async functions."""
         self._propagate_default_args(node)
+        self._scan_function_returns(node)
+        self._check_decorator_taint(node)
         self.generic_visit(node)
 
     def _propagate_default_args(
         self, node: ast.FunctionDef | ast.AsyncFunctionDef
     ) -> None:
-        """Taint function parameters whose defaults resolve to dangerous values."""
+        """Taint function parameters whose defaults resolve to dangerous values.
+
+        W17 H2: Also handles positional-only args (posonlyargs). Defaults are
+        right-aligned to the full positional list (posonlyargs + args).
+        """
         args = node.args
-        # Regular args — defaults align right-to-left with args
+        # W17 H2: Combine posonlyargs + args for right-aligned default matching
+        all_positional = list(args.posonlyargs) + list(args.args)
         n_defaults = len(args.defaults)
         if n_defaults:
-            defaulted_args = args.args[-n_defaults:]
+            defaulted_args = all_positional[-n_defaults:]
             for arg, default in zip(defaulted_args, args.defaults):
                 self._propagate_taint(arg.arg, default)
         # kw-only defaults
@@ -308,13 +325,28 @@ class DangerousNodeVisitor(ast.NodeVisitor):
             self._propagate_taint(target.id, value)
         elif isinstance(target, (ast.Tuple, ast.List)):
             # For destructuring, propagate to each element.
-            # If value is also a tuple/list literal of matching length,
-            # propagate element-wise.
-            if isinstance(value, (ast.Tuple, ast.List)) and len(value.elts) == len(
-                target.elts
+            # W17 H1: Check for Starred elements — starred makes exact-length
+            # matching unreliable, so propagate all value elements to all targets.
+            has_starred = any(isinstance(e, ast.Starred) for e in target.elts)
+            if (
+                not has_starred
+                and isinstance(value, (ast.Tuple, ast.List))
+                and len(value.elts) == len(target.elts)
             ):
                 for t, v in zip(target.elts, value.elts):
                     self._propagate_taint_target(t, v)
+            elif isinstance(value, (ast.Tuple, ast.List)):
+                # W17 H1: Try each value element per target; stop at first
+                # that resolves to avoid stale-taint clearing from
+                # non-resolving elements wiping valid taint.
+                for elt in target.elts:
+                    for v in value.elts:
+                        r = self._resolve_rhs(v)
+                        if r is None:
+                            r = self._peel_to_resolve(v)
+                        if r is not None:
+                            self._propagate_taint_target(elt, v)
+                            break
             else:
                 # Can't decompose value — propagate full value to each name leaf
                 for elt in target.elts:
@@ -345,6 +377,10 @@ class DangerousNodeVisitor(ast.NodeVisitor):
             return
 
         resolved = self._resolve_rhs(value)
+        if resolved is None:
+            # W17 C1: Fall back to _peel_to_resolve for wrapped values.
+            # Catches: f = (lambda y: y)(os.system), f = staticmethod(os.system)
+            resolved = self._peel_to_resolve(value)
         if resolved is None:
             return
 
@@ -439,6 +475,124 @@ class DangerousNodeVisitor(ast.NodeVisitor):
         if isinstance(node, ast.NamedExpr):
             return self._peel_to_resolve(node.value)
 
+        # W17 H3: Subscript on dict literal: {"k": os.environ}["k"]
+        if isinstance(node, ast.Subscript) and isinstance(node.value, ast.Dict):
+            key = None
+            if isinstance(node.slice, ast.Constant):
+                key = node.slice.value
+            if key is not None:
+                dict_node = node.value
+                for k, v in zip(dict_node.keys, dict_node.values):
+                    if (
+                        isinstance(k, ast.Constant)
+                        and k.value == key
+                        and v is not None
+                    ):
+                        return self._peel_to_resolve(v)
+
+        return None
+
+    # --- W17: Helper methods for new bypass detection ---
+
+    def _is_dangerous_resolved(self, resolved: str) -> bool:
+        """Check if a resolved qualified name refers to a dangerous callable."""
+        parts = resolved.rsplit(".", 1)
+        if len(parts) == 2:
+            module_part, func_name = parts
+            if module_part == "os" and func_name in _DANGEROUS_OS_FUNCS:
+                return True
+            if module_part == "os" and func_name in {"environ", "getenv"}:
+                return True
+            if module_part == "os.environ":
+                return True
+            if module_part == "subprocess" and func_name in _DANGEROUS_SUBPROCESS_FUNCS:
+                return True
+            if module_part == "shutil" and func_name in _DANGEROUS_SHUTIL_FUNCS:
+                return True
+            if module_part == "asyncio" and func_name in _DANGEROUS_ASYNCIO_FUNCS:
+                return True
+            if module_part == "builtins" and (
+                func_name in _BLANKET_BLOCKED_BUILTINS or func_name == "__import__"
+            ):
+                return True
+            root = module_part.split(".")[0]
+            if root in _ALL_DANGEROUS_MODULES:
+                return True
+        else:
+            if resolved in _ALL_DANGEROUS_MODULES or resolved in {"os", "sys"}:
+                return True
+        return False
+
+    def _flag_for_resolved(self, resolved: str) -> Optional[str]:
+        """Return the appropriate flag for a dangerous resolved value."""
+        parts = resolved.rsplit(".", 1)
+        if len(parts) == 2:
+            module_part, func_name = parts
+            if module_part == "os" and func_name in {"environ", "getenv"}:
+                return "blocked.credential_exfil"
+            if module_part == "os.environ":
+                return "blocked.credential_exfil"
+            if module_part in _DANGEROUS_EXFIL_MODULES:
+                return "blocked.credential_exfil"
+            root = module_part.split(".")[0]
+            if root in _DANGEROUS_EXFIL_MODULES:
+                return "blocked.credential_exfil"
+        return "blocked.shell_injection"
+
+    def _check_dangerous_attr_assign(
+        self, target: ast.expr, value: ast.expr
+    ) -> None:
+        """W17 C2: Flag attribute assignments where value is a dangerous callable.
+
+        Catches: cls.pwn = staticmethod(os.system), self.run = subprocess.call
+        """
+        if not isinstance(target, ast.Attribute):
+            return
+        resolved = self._peel_to_resolve(value)
+        if resolved is not None and self._is_dangerous_resolved(resolved):
+            self.flags.append(self._flag_for_resolved(resolved))
+
+    def _scan_function_returns(
+        self, node: ast.FunctionDef | ast.AsyncFunctionDef
+    ) -> None:
+        """W17 C4: Scan function body for return statements with dangerous values."""
+        for child in ast.walk(node):
+            if isinstance(child, ast.Return) and child.value is not None:
+                resolved = self._peel_to_resolve(child.value)
+                if resolved is not None and self._is_dangerous_resolved(resolved):
+                    self._func_return_taint[node.name] = resolved
+                    return
+
+    def _check_decorator_taint(
+        self, node: ast.FunctionDef | ast.AsyncFunctionDef
+    ) -> None:
+        """W17 C4: If a decorator returns dangerous values, taint the decorated name."""
+        for deco in node.decorator_list:
+            deco_name = None
+            if isinstance(deco, ast.Name):
+                deco_name = deco.id
+            elif isinstance(deco, ast.Attribute):
+                deco_name = _resolve_attr_chain(deco)
+            if deco_name is not None and deco_name in self._func_return_taint:
+                dangerous_val = self._func_return_taint[deco_name]
+                # Use same routing as _propagate_taint for alias storage
+                if (
+                    dangerous_val in self._module_aliases.values()
+                    or dangerous_val in _ALL_DANGEROUS_MODULES
+                    or dangerous_val in {"os", "sys", "builtins"}
+                ):
+                    self._module_aliases[node.name] = dangerous_val
+                else:
+                    self._name_aliases[node.name] = dangerous_val
+
+    def _resolve_string_expr(self, node: ast.expr) -> Optional[str]:
+        """W17 H4: Resolve simple string expressions (constant or aliased name)."""
+        if isinstance(node, ast.Constant) and isinstance(node.value, str):
+            return node.value
+        if isinstance(node, ast.Name):
+            val = self._name_aliases.get(node.id)
+            if val is not None:
+                return val
         return None
 
     # --- Call analysis ---
@@ -461,6 +615,21 @@ class DangerousNodeVisitor(ast.NodeVisitor):
                 self.flags.append("blocked.shell_injection")
             elif arg in _DANGEROUS_EXFIL_MODULES:
                 self.flags.append("blocked.credential_exfil")
+            return
+
+        # W17 C3: type() with 3 args — dynamic class synthesis
+        # Inspect dict values for dangerous callables
+        if name == "type" and len(node.args) == 3:
+            dict_arg = node.args[2]
+            if isinstance(dict_arg, ast.Dict):
+                for val in dict_arg.values:
+                    if val is not None:
+                        resolved = self._peel_to_resolve(val)
+                        if resolved is not None and self._is_dangerous_resolved(
+                            resolved
+                        ):
+                            self.flags.append(self._flag_for_resolved(resolved))
+                            return
             return
 
         # getattr on a dangerous module: getattr(os, "system")
@@ -600,6 +769,12 @@ class DangerousNodeVisitor(ast.NodeVisitor):
                 attr_arg = self._name_aliases.get(second.id)
                 if attr_arg is None and second.id in self._module_aliases:
                     attr_arg = self._module_aliases[second.id]
+            # W17 H4: try constant folding for string concatenation
+            elif isinstance(second, ast.BinOp) and isinstance(second.op, ast.Add):
+                left = self._resolve_string_expr(second.left)
+                right = self._resolve_string_expr(second.right)
+                if left is not None and right is not None:
+                    attr_arg = left + right
         if attr_arg is not None and attr_arg in _DANGEROUS_DUNDER_ATTRS:
             self.flags.append("blocked.shell_injection")
             return
