@@ -331,6 +331,17 @@ class DangerousNodeVisitor(ast.NodeVisitor):
                 if chain_name and chain_name.split(".")[0] in self._module_aliases:
                     root = chain_name.split(".")[0]
                     chain_name = chain_name.replace(root, self._module_aliases[root], 1)
+                # W24 C3: Also resolve root through _name_aliases
+                # Catches: from itertools import chain; chain.from_iterable(...)
+                elif chain_name and chain_name.split(".")[0] in self._name_aliases:
+                    root = chain_name.split(".")[0]
+                    resolved_root = self._name_aliases[root]
+                    chain_name = chain_name.replace(root, resolved_root, 1)
+            # W24 C3: Handle bare Name callee (from itertools import chain; chain(...))
+            elif isinstance(call_func, ast.Name):
+                resolved_name = self._name_aliases.get(call_func.id)
+                if resolved_name is not None:
+                    chain_name = resolved_name
             if chain_name in ("itertools.chain", "itertools.chain.from_iterable"):
                 for arg in iterable.args:
                     arg_resolved = self._peel_to_resolve(arg)
@@ -338,19 +349,33 @@ class DangerousNodeVisitor(ast.NodeVisitor):
                         self._propagate_taint_target(target, arg)
                         return
                     # Also check list/tuple literal args for tainted elements
+                    # W24 M1: True recursive descent (replaces W23 M1 fixed-depth)
                     if isinstance(arg, (ast.List, ast.Tuple)):
-                        for elt in arg.elts:
-                            elt_resolved = self._peel_to_resolve(elt)
-                            if elt_resolved is not None and self._is_dangerous_resolved(elt_resolved):
-                                self._propagate_taint_target(target, elt)
-                                return
-                            # W23 M1: Recurse into nested List/Tuple for from_iterable
-                            if isinstance(elt, (ast.List, ast.Tuple)):
-                                for nested_elt in elt.elts:
-                                    nested_resolved = self._peel_to_resolve(nested_elt)
-                                    if nested_resolved is not None and self._is_dangerous_resolved(nested_resolved):
-                                        self._propagate_taint_target(target, nested_elt)
-                                        return
+                        if self._scan_nested_iterable_for_taint(arg, target):
+                            return
+
+    def _scan_nested_iterable_for_taint(
+        self, node: ast.expr, target: ast.expr, depth: int = 0
+    ) -> bool:
+        """W24 M1: Recursively scan nested List/Tuple for dangerous elements.
+
+        Replaces W23's fixed one-level expansion with true recursive descent.
+        Returns True if taint was propagated (caller should return early).
+        Depth-limited to 10 to prevent pathological nesting.
+        """
+        if depth > 10:
+            return False
+        if not isinstance(node, (ast.List, ast.Tuple)):
+            return False
+        for elt in node.elts:
+            elt_resolved = self._peel_to_resolve(elt)
+            if elt_resolved is not None and self._is_dangerous_resolved(elt_resolved):
+                self._propagate_taint_target(target, elt)
+                return True
+            if isinstance(elt, (ast.List, ast.Tuple)):
+                if self._scan_nested_iterable_for_taint(elt, target, depth + 1):
+                    return True
+        return False
 
     def visit_With(self, node: ast.With) -> None:
         """Track with-statement taint: ``with open(...) as f: ...``"""
@@ -669,6 +694,18 @@ class DangerousNodeVisitor(ast.NodeVisitor):
             # Catches: f = (lambda y: y)(os.system), f = staticmethod(os.system)
             resolved = self._peel_to_resolve(value)
         if resolved is None:
+            # W24 H4: Class alias — copy class attr taint for class name aliases
+            # Catches: Alias = Base where Base has tainted class attrs
+            if isinstance(value, ast.Name):
+                src_name = value.id
+                prefix = f"{src_name}."
+                for key, val in list(self._class_attr_taint.items()):
+                    if key.startswith(prefix):
+                        attr_part = key[len(prefix):]
+                        new_key = f"{target_name}.{attr_part}"
+                        if new_key not in self._class_attr_taint:
+                            self._class_attr_taint[new_key] = val
+                            self._name_aliases[new_key] = val
             return
 
         # Determine if resolved is a module (goes to _module_aliases)
@@ -759,6 +796,7 @@ class DangerousNodeVisitor(ast.NodeVisitor):
             # W19 C2: If callee has recorded return taint, use it.
             # Catches: def make(): return os.system; f = make(); f("id")
             callee_name = None
+            resolved_callee = None
             if isinstance(node.func, ast.Name):
                 callee_name = node.func.id
             elif isinstance(node.func, ast.Attribute):
@@ -772,9 +810,11 @@ class DangerousNodeVisitor(ast.NodeVisitor):
                 )
                 if taint is not None:
                     return taint
+            # W24 C2: Normalize aliased getattr callee (builtins.getattr → getattr)
+            resolved_callee_for_getattr = resolved_callee or callee_name
             # W23 L1: For getattr(mod, "attr") calls, resolve as "mod.attr"
             # instead of just the first arg — prevents false positives on safe attrs
-            if callee_name == "getattr" and len(node.args) >= 2:
+            if resolved_callee_for_getattr in ("getattr", "builtins.getattr") and len(node.args) >= 2:
                 first_resolved = self._peel_to_resolve(node.args[0])
                 attr_str = _get_constant_arg(node, 1)
                 if first_resolved is not None and attr_str is not None:
@@ -793,6 +833,14 @@ class DangerousNodeVisitor(ast.NodeVisitor):
         # Catches: return (lambda: os.system) where the lambda wraps a dangerous value
         if isinstance(node, ast.Lambda):
             return self._peel_to_resolve(node.body)
+
+        # W24 H7: List/Tuple containing dangerous elements — taint the container
+        # Catches: items = [os.system]; functools.reduce(fn, items)
+        if isinstance(node, (ast.List, ast.Tuple)):
+            for elt in node.elts:
+                r = self._peel_to_resolve(elt)
+                if r is not None and self._is_dangerous_resolved(r):
+                    return r
 
         # W19 C3: Dict with dangerous values — taint propagates through the dict
         # Catches: ns = {"run": os.system}; type("C", (), ns)
@@ -1168,6 +1216,15 @@ class DangerousNodeVisitor(ast.NodeVisitor):
         # Check if this name is an alias for a dangerous function
         if name in self._name_aliases:
             qualified = self._name_aliases[name]
+            # W24 C2: Aliased getattr — route to _check_getattr
+            # Catches: from builtins import getattr as g; g(os, "system")
+            if qualified == "builtins.getattr" and len(node.args) >= 2:
+                self._check_getattr(node)
+                return
+            # W24 H1: Aliased builtins.open — route to _check_open_sensitive
+            if qualified == "builtins.open":
+                self._check_open_sensitive(node)
+                return
             # W23 H2: Check higher-order functions via from-import aliases
             self._check_higher_order_call(qualified, node)
             self._check_qualified_call(qualified)
@@ -1187,6 +1244,17 @@ class DangerousNodeVisitor(ast.NodeVisitor):
                 receiver_resolved = self._peel_to_resolve(func.value)
                 if receiver_resolved == "os.environ":
                     self.flags.append("blocked.credential_exfil")
+            # W24 H2: pathlib.Path.read_text/read_bytes — sensitive file reads
+            elif func.attr in ("read_text", "read_bytes", "read_bytes"):
+                # Try to resolve the receiver to check for sensitive paths
+                if isinstance(func.value, ast.Call):
+                    path_arg = _get_constant_arg(func.value, 0)
+                    if path_arg is not None:
+                        path_lower = path_arg.lower()
+                        for fragment in _SENSITIVE_PATH_FRAGMENTS:
+                            if fragment in path_lower:
+                                self.flags.append("blocked.credential_exfil")
+                                break
             return
 
         # Resolve the root through module aliases
@@ -1356,12 +1424,10 @@ class DangerousNodeVisitor(ast.NodeVisitor):
                 attr_arg = self._name_aliases.get(second.id)
                 if attr_arg is None and second.id in self._module_aliases:
                     attr_arg = self._module_aliases[second.id]
-            # W17 H4: try constant folding for string concatenation
-            elif isinstance(second, ast.BinOp) and isinstance(second.op, ast.Add):
-                left = self._resolve_string_expr(second.left)
-                right = self._resolve_string_expr(second.right)
-                if left is not None and right is not None:
-                    attr_arg = left + right
+            # W24 C1: Use _resolve_string_expr for ALL string expression forms
+            # Replaces W17 H4 BinOp-only handling. Now catches f-strings, join, chr, etc.
+            if attr_arg is None:
+                attr_arg = self._resolve_string_expr(second)
         if attr_arg is not None and attr_arg in _DANGEROUS_DUNDER_ATTRS:
             self.flags.append("blocked.shell_injection")
             return
@@ -1431,9 +1497,16 @@ class DangerousNodeVisitor(ast.NodeVisitor):
                 else:
                     self.flags.append("blocked.shell_injection")
             else:
-                # W23 H3: Route through _check_qualified_call for general resolution
+                # W24 H5+H6: Check _is_dangerous_resolved first (catches os.environ, builtins.open)
                 synthetic_qual = f"{taint_source}.{attr_arg}"
-                self._check_qualified_call(synthetic_qual)
+                if self._is_dangerous_resolved(synthetic_qual):
+                    self.flags.append(self._flag_for_resolved(synthetic_qual))
+                elif taint_source == "builtins" and attr_arg in (
+                    *_BLANKET_BLOCKED_BUILTINS, "__import__", "open"
+                ):
+                    self.flags.append("blocked.shell_injection")
+                else:
+                    self._check_qualified_call(synthetic_qual)
             return
 
         if resolved_mod in _ALL_DANGEROUS_MODULES or resolved_mod == "os":
@@ -1571,11 +1644,22 @@ class DangerousNodeVisitor(ast.NodeVisitor):
         if self._is_os_environ_expr(arg):
             self.flags.append("blocked.credential_exfil")
             return
+        # W24 H3: Wrapped environ — peel through lambda/identity wrappers
+        # Catches: dict((lambda x: x)(os.environ))
+        resolved_arg = self._peel_to_resolve(arg)
+        if resolved_arg == "os.environ":
+            self.flags.append("blocked.credential_exfil")
+            return
 
         # list(os.environ.items()) / list(os.environ.values())
         if (isinstance(arg, ast.Call) and isinstance(arg.func, ast.Attribute)
                 and arg.func.attr in ("items", "values", "keys")):
             if self._is_os_environ_expr(arg.func.value):
+                self.flags.append("blocked.credential_exfil")
+                return
+            # W24 H3: Also peel wrapped receivers
+            recv_resolved = self._peel_to_resolve(arg.func.value)
+            if recv_resolved == "os.environ":
                 self.flags.append("blocked.credential_exfil")
 
     def _is_os_environ_expr(self, node: ast.expr) -> bool:

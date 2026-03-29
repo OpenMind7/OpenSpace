@@ -2305,3 +2305,226 @@ class TestW23SafeBuiltinsNegative:
             'getattr(builtins, "int")("42")\n'
         )
         assert check_ast_safety(src) == []
+
+
+# ---------------------------------------------------------------------------
+# W24: Codex W23 review findings — 11 fixes (3C + 7H + 1M)
+# ---------------------------------------------------------------------------
+
+class TestW24CritGetattr:
+    """W24 C1: Inline string-expr getattr dunder bypass via f-string/join."""
+
+    def test_getattr_fstring_dunder(self) -> None:
+        src = 'getattr(object, f"__subclasses__")()'
+        assert check_ast_safety(src) != []
+
+    def test_getattr_join_dunder(self) -> None:
+        src = 'getattr(object, "".join(["__", "globals__"]))'
+        assert check_ast_safety(src) != []
+
+    def test_getattr_chr_dunder(self) -> None:
+        src = 'getattr(object, chr(95)+chr(95)+"globals"+chr(95)+chr(95))'
+        assert check_ast_safety(src) != []
+
+
+class TestW24CritAliasedGetattr:
+    """W24 C2: Aliased getattr (from builtins import getattr as g)."""
+
+    def test_aliased_getattr_class_attr(self) -> None:
+        src = (
+            'import os, builtins\n'
+            'from builtins import getattr as g\n'
+            'class C:\n'
+            '    mod = os\n'
+            'g(C.mod, "system")("id")\n'
+        )
+        assert check_ast_safety(src) != []
+
+    def test_aliased_getattr_environ(self) -> None:
+        src = (
+            'import os, builtins\n'
+            'from builtins import getattr as g\n'
+            'class C:\n'
+            '    env = os.environ\n'
+            'g(C.env, "get")("PASSWORD")\n'
+        )
+        assert check_ast_safety(src) != []
+
+    def test_aliased_getattr_eval(self) -> None:
+        src = (
+            'import builtins\n'
+            'from builtins import getattr as g\n'
+            'class C:\n'
+            '    b = builtins\n'
+            'g(C.b, "eval")("1+1")\n'
+        )
+        assert check_ast_safety(src) != []
+
+
+class TestW24CritChainAlias:
+    """W24 C3: from itertools import chain bypasses taint propagation."""
+
+    def test_chain_from_import_from_iterable(self) -> None:
+        src = (
+            'import os\n'
+            'from itertools import chain\n'
+            'for f in chain.from_iterable([[os.system]]): f("id")\n'
+        )
+        assert check_ast_safety(src) != []
+
+    def test_chain_from_import_alias(self) -> None:
+        src = (
+            'import os\n'
+            'from itertools import chain as ch\n'
+            'for f in ch.from_iterable([[os.system]]): f("id")\n'
+        )
+        assert check_ast_safety(src) != []
+
+    def test_chain_bare_call(self) -> None:
+        src = (
+            'import os\n'
+            'from itertools import chain\n'
+            'for f in chain([os.system]): f("id")\n'
+        )
+        assert check_ast_safety(src) != []
+
+
+class TestW24HighOpenAlias:
+    """W24 H1: Sensitive-path open() aliasing bypass."""
+
+    def test_open_alias_sensitive(self) -> None:
+        src = (
+            'from builtins import open as o\n'
+            'o("/home/user/.ssh/id_rsa")\n'
+        )
+        assert check_ast_safety(src) != []
+
+    # Deferred: o = open doesn't resolve to builtins.open (bare builtin not tracked)
+    # Will be addressed in W25 backlog item for builtin name aliasing
+
+
+class TestW24HighPathlib:
+    """W24 H2: pathlib.Path.read_text/read_bytes sensitive file reads."""
+
+    def test_pathlib_read_text_ssh(self) -> None:
+        src = (
+            'from pathlib import Path\n'
+            'Path("/home/user/.ssh/id_rsa").read_text()\n'
+        )
+        assert check_ast_safety(src) != []
+
+    def test_pathlib_read_bytes_ssh(self) -> None:
+        src = (
+            'from pathlib import Path\n'
+            'Path("/home/user/.ssh/id_rsa").read_bytes()\n'
+        )
+        assert check_ast_safety(src) != []
+
+
+class TestW24HighWrappedEnviron:
+    """W24 H3: Wrapped os.environ bypasses whole-env detection."""
+
+    def test_dict_lambda_environ(self) -> None:
+        src = (
+            'import os\n'
+            'dict((lambda x: x)(os.environ))\n'
+        )
+        assert check_ast_safety(src) != []
+
+    def test_list_lambda_environ_items(self) -> None:
+        src = (
+            'import os\n'
+            'list((lambda x: x)(os.environ).items())\n'
+        )
+        assert check_ast_safety(src) != []
+
+
+class TestW24HighClassAliasInheritance:
+    """W24 H4: Class alias inheritance taint loss."""
+
+    def test_alias_base_inheritance(self) -> None:
+        src = (
+            'import os\n'
+            'class Base:\n'
+            '    run = os.system\n'
+            'Alias = Base\n'
+            'class Child(Alias): pass\n'
+            'Child.run("id")\n'
+        )
+        assert check_ast_safety(src) != []
+
+    def test_alias_base_environ(self) -> None:
+        src = (
+            'import os\n'
+            'class Base:\n'
+            '    env = os.environ\n'
+            'Alias = Base\n'
+            'class Child(Alias): pass\n'
+            'Child.env.get("SECRET")\n'
+        )
+        assert check_ast_safety(src) != []
+
+
+class TestW24HighGettattrClassEnviron:
+    """W24 H5: getattr(C.mod, attr) misses os.environ exfil."""
+
+    def test_getattr_class_mod_environ(self) -> None:
+        src = (
+            'import os\n'
+            'class C:\n'
+            '    mod = os\n'
+            'getattr(C.mod, "environ").get("SECRET")\n'
+        )
+        assert check_ast_safety(src) != []
+
+
+class TestW24HighGettattrClassOpen:
+    """W24 H6: getattr(C.b, 'open') allowed through class-attr path."""
+
+    def test_getattr_class_builtins_open(self) -> None:
+        src = (
+            'import builtins\n'
+            'class C:\n'
+            '    b = builtins\n'
+            'getattr(C.b, "open")("/etc/passwd")\n'
+        )
+        assert check_ast_safety(src) != []
+
+
+class TestW24HighNamedCollections:
+    """W24 H7: Named list/tuple contents not inspected in reduce."""
+
+    def test_reduce_named_list(self) -> None:
+        src = (
+            'import os, functools\n'
+            'items = [os.system]\n'
+            'functools.reduce(lambda acc, f: f, items)("id")\n'
+        )
+        assert check_ast_safety(src) != []
+
+    def test_reduce_from_import_named_list(self) -> None:
+        src = (
+            'import os\n'
+            'from functools import reduce\n'
+            'items = [os.system]\n'
+            'reduce(lambda acc, f: f, items)("id")\n'
+        )
+        assert check_ast_safety(src) != []
+
+
+class TestW24MedChainRecursion:
+    """W24 M1: chain.from_iterable 3+ nesting levels."""
+
+    def test_triple_nested(self) -> None:
+        src = (
+            'import os, itertools\n'
+            'for f in itertools.chain.from_iterable([[[os.system]]]): f("id")\n'
+        )
+        assert check_ast_safety(src) != []
+
+    def test_nested_tuple_in_list(self) -> None:
+        src = (
+            'import os, itertools\n'
+            'for f in itertools.chain.from_iterable([[(os.system,)]]): f("id")\n'
+        )
+        assert check_ast_safety(src) != []
