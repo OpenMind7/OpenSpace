@@ -1808,3 +1808,126 @@ class TestW21ForkDenylist:
     def test_os_fork_getattr(self) -> None:
         src = 'import os\ngetattr(os, "fork")()\n'
         assert "blocked.shell_injection" in check_ast_safety(src)
+
+
+# ---------------------------------------------------------------------------
+# W21.1: Metaclass safe-list provenance verification (Codex CRIT)
+# ---------------------------------------------------------------------------
+
+class TestW211MetaclassProvenance:
+    """W21.1: Metaclass allowlist must verify import provenance, not just name."""
+
+    def test_shadowed_abcmeta_blocked(self) -> None:
+        """User-defined ABCMeta with dangerous __prepare__ must be blocked."""
+        src = (
+            'import os\n'
+            'class ABCMeta(type):\n'
+            '    @classmethod\n'
+            '    def __prepare__(mcs, name, bases):\n'
+            '        return {"run": os.system}\n'
+            'class Foo(metaclass=ABCMeta):\n'
+            '    pass\n'
+        )
+        assert "blocked.shell_injection" in check_ast_safety(src)
+
+    def test_attacker_module_abcmeta_blocked(self) -> None:
+        """attacker.ABCMeta must be blocked — wrong provenance."""
+        src = (
+            'import attacker\n'
+            'class Foo(metaclass=attacker.ABCMeta):\n'
+            '    pass\n'
+        )
+        assert "blocked.shell_injection" in check_ast_safety(src)
+
+    def test_genuine_abc_abcmeta_allowed(self) -> None:
+        """from abc import ABCMeta → genuine provenance, must be allowed."""
+        src = (
+            'from abc import ABCMeta\n'
+            'class Foo(metaclass=ABCMeta):\n'
+            '    pass\n'
+        )
+        assert check_ast_safety(src) == []
+
+    def test_genuine_abc_dot_abcmeta_allowed(self) -> None:
+        """metaclass=abc.ABCMeta → genuine provenance via attribute."""
+        src = (
+            'import abc\n'
+            'class Foo(metaclass=abc.ABCMeta):\n'
+            '    pass\n'
+        )
+        assert check_ast_safety(src) == []
+
+    def test_aliased_abc_allowed(self) -> None:
+        """import abc as a; metaclass=a.ABCMeta → resolved provenance."""
+        src = (
+            'import abc as a\n'
+            'class Foo(metaclass=a.ABCMeta):\n'
+            '    pass\n'
+        )
+        assert check_ast_safety(src) == []
+
+    def test_renamed_import_blocked(self) -> None:
+        """from attacker import EvilMeta as ABCMeta → name match but wrong provenance."""
+        src = (
+            'from attacker import EvilMeta as ABCMeta\n'
+            'class Foo(metaclass=ABCMeta):\n'
+            '    pass\n'
+        )
+        assert "blocked.shell_injection" in check_ast_safety(src)
+
+    def test_enum_meta_genuine(self) -> None:
+        """from enum import EnumMeta → genuine provenance."""
+        src = (
+            'from enum import EnumMeta\n'
+            'class MyEnum(metaclass=EnumMeta):\n'
+            '    pass\n'
+        )
+        assert check_ast_safety(src) == []
+
+    def test_metaclass_type_always_safe(self) -> None:
+        """metaclass=type is always safe (builtin)."""
+        src = 'class Foo(metaclass=type):\n    pass\n'
+        assert check_ast_safety(src) == []
+
+
+# ---------------------------------------------------------------------------
+# W21.1: __build_class__ bypass prevention (Codex HIGH)
+# ---------------------------------------------------------------------------
+
+class TestW211BuildClass:
+    """W21.1: __build_class__ must be blocked to prevent metaclass bypass."""
+
+    def test_build_class_direct(self) -> None:
+        src = '__build_class__(lambda: None, "Foo")\n'
+        assert "blocked.shell_injection" in check_ast_safety(src)
+
+    def test_build_class_with_metaclass(self) -> None:
+        src = (
+            'import os\n'
+            'class Evil(type):\n'
+            '    @classmethod\n'
+            '    def __prepare__(mcs, name, bases):\n'
+            '        return {"run": os.system}\n'
+            'Foo = __build_class__(lambda: None, "Foo", metaclass=Evil)\n'
+        )
+        assert "blocked.shell_injection" in check_ast_safety(src)
+
+
+# ---------------------------------------------------------------------------
+# W21.1: posix module fork bypass (Codex HIGH)
+# ---------------------------------------------------------------------------
+
+class TestW211PosixFork:
+    """W21.1: posix.fork() must be blocked — direct access to fork/forkpty."""
+
+    def test_posix_fork_direct(self) -> None:
+        src = 'import posix\nposix.fork()\n'
+        assert "blocked" in str(check_ast_safety(src))
+
+    def test_posix_forkpty(self) -> None:
+        src = 'import posix\nposix.forkpty()\n'
+        assert "blocked" in str(check_ast_safety(src))
+
+    def test_from_posix_import_fork(self) -> None:
+        src = 'from posix import fork\nfork()\n'
+        assert "blocked" in str(check_ast_safety(src))

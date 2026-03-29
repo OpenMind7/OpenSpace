@@ -41,6 +41,8 @@ _DANGEROUS_EXEC_MODULES: frozenset[str] = frozenset({
     "gc",                                 # gc.get_objects() enumerates live objects in memory
     # W20.1: operator reflection — attrgetter/methodcaller bypass attribute checks
     "operator",
+    # W21.1: posix module exposes fork/forkpty/exec* directly (Codex finding)
+    "posix",
 })
 
 _DANGEROUS_EXFIL_MODULES: frozenset[str] = frozenset({
@@ -111,14 +113,22 @@ _BLANKET_BLOCKED_BUILTINS: frozenset[str] = frozenset({
     "breakpoint",  # S2: drops into interactive debugger → shell access
     # W12.1: globals()/locals() enable __import__ via dict subscription
     "globals", "locals", "vars",
+    # W21.1: __build_class__ bypasses visit_ClassDef metaclass check (Codex finding)
+    "__build_class__",
 })
 
 # W21: Known-safe metaclasses that don't inject via __prepare__
-_SAFE_METACLASS_NAMES: frozenset[str] = frozenset({
-    "type",          # builtin default
-    "ABCMeta",       # abc.ABCMeta
-    "EnumMeta",      # enum.EnumMeta / enum.EnumType
-    "EnumType",      # Python 3.11+
+# W21.1: Use fully-qualified names for provenance verification (Codex finding)
+_SAFE_METACLASS_FQN: frozenset[str] = frozenset({
+    "type",              # builtin default (no module prefix)
+    "builtins.type",     # explicit builtins.type
+    "abc.ABCMeta",       # abc.ABCMeta
+    "enum.EnumMeta",     # enum.EnumMeta
+    "enum.EnumType",     # Python 3.11+
+})
+# Short names — ONLY trusted when provenance is verified via import alias resolution
+_SAFE_METACLASS_SHORT: frozenset[str] = frozenset({
+    "type", "ABCMeta", "EnumMeta", "EnumType",
 })
 
 # W12.1: Dangerous dunder attributes — sandbox escape via introspection
@@ -379,12 +389,29 @@ class DangerousNodeVisitor(ast.NodeVisitor):
                         self._class_attr_taint[qual] = resolved
         self.generic_visit(node)
 
+    @staticmethod
+    def _resolve_attribute_chain(node: ast.expr) -> Optional[str]:
+        """Build a dotted name from a nested ast.Attribute chain.
+
+        Returns e.g. ``"abc.ABCMeta"`` for ``abc.ABCMeta``, or None if
+        the chain contains non-Name/non-Attribute nodes.
+        """
+        parts: list[str] = []
+        cur = node
+        while isinstance(cur, ast.Attribute):
+            parts.append(cur.attr)
+            cur = cur.value
+        if isinstance(cur, ast.Name):
+            parts.append(cur.id)
+            return ".".join(reversed(parts))
+        return None
+
     def _check_metaclass_keyword(self, node: ast.ClassDef) -> None:
         """W21: Flag classes with unknown metaclass= that could inject via __prepare__.
 
-        Known-safe metaclasses (type, ABCMeta, EnumMeta) are allowed.
-        Unknown metaclasses are flagged because ``__prepare__`` can return a
-        custom namespace dict pre-populated with dangerous callables.
+        W21.1: Provenance-verified resolution. Bare names like ``ABCMeta`` are
+        only trusted if they were imported from a known-safe module (abc, enum).
+        User-defined classes with the same name are blocked.
         """
         for kw in node.keywords:
             if kw.arg != "metaclass":
@@ -392,19 +419,29 @@ class DangerousNodeVisitor(ast.NodeVisitor):
             mc = kw.value
             # Direct Name: metaclass=type, metaclass=ABCMeta
             if isinstance(mc, ast.Name):
-                if mc.id in _SAFE_METACLASS_NAMES:
+                # "type" is always safe (builtin, cannot be shadowed via import)
+                if mc.id == "type":
                     return  # safe
-                # Check if it's an alias for a safe metaclass
-                resolved = self._name_aliases.get(mc.id) or self._module_aliases.get(mc.id)
-                if resolved and resolved.split(".")[-1] in _SAFE_METACLASS_NAMES:
-                    return  # e.g., abc.ABCMeta aliased
-                # Unknown metaclass — flag conservatively
+                # For other names, verify import provenance
+                resolved = self._module_aliases.get(mc.id) or self._name_aliases.get(mc.id)
+                if resolved and resolved in _SAFE_METACLASS_FQN:
+                    return  # e.g., from abc import ABCMeta → resolved="abc.ABCMeta"
+                # Unknown or user-defined — flag conservatively
                 self.flags.append("blocked.shell_injection")
                 return
             # Attribute: metaclass=abc.ABCMeta
             if isinstance(mc, ast.Attribute):
-                if mc.attr in _SAFE_METACLASS_NAMES:
-                    return  # safe
+                # Build fully-qualified name and check provenance
+                fqn = self._resolve_attribute_chain(mc)
+                if fqn and fqn in _SAFE_METACLASS_FQN:
+                    return  # safe — verified provenance
+                # Also check if root is aliased: e.g., import abc as a; a.ABCMeta
+                if isinstance(mc.value, ast.Name):
+                    root_resolved = self._module_aliases.get(mc.value.id)
+                    if root_resolved:
+                        full = f"{root_resolved}.{mc.attr}"
+                        if full in _SAFE_METACLASS_FQN:
+                            return  # safe
                 self.flags.append("blocked.shell_injection")
                 return
             # Any other expression (call, subscript, etc.) — fail-closed
