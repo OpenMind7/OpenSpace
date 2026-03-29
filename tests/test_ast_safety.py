@@ -1372,3 +1372,175 @@ class TestW19HighNestedStringConcat:
         """Nested concat of safe string must not be flagged."""
         src = 'getattr(object, "__" + "st" + "r__")'
         assert check_ast_safety(src) == []
+
+
+# ---------------------------------------------------------------------------
+# W20: Comprehensive bypass regression tests
+# ---------------------------------------------------------------------------
+
+
+class TestW20ComprehensionTaintLaundering:
+    """W20 C2: Comprehension/generator taint bypasses."""
+
+    def test_listcomp_subscript_call(self) -> None:
+        src = 'import os; [x for x in [os.system]][0]("id")'
+        assert "blocked.shell_injection" in check_ast_safety(src)
+
+    def test_genexpr_next_call(self) -> None:
+        src = 'import subprocess; f = next(x for x in [subprocess.run]); f(["ls"])'
+        assert "blocked.shell_injection" in check_ast_safety(src)
+
+    def test_walrus_in_genexpr(self) -> None:
+        src = 'import os; any((y := x) for x in [os.system]); y("id")'
+        assert "blocked.shell_injection" in check_ast_safety(src)
+
+    @pytest.mark.xfail(reason="W20.1: setcomp without call site not yet flagged")
+    def test_setcomp_credential(self) -> None:
+        src = 'import os; {x for x in [os.environ]}'
+        assert "blocked.credential_exfil" in check_ast_safety(src)
+
+    @pytest.mark.xfail(reason="W20.1: dictcomp tuple-unpack taint not yet tracked")
+    def test_dictcomp_taint(self) -> None:
+        src = 'import os; d = {k: v for k, v in [("run", os.system)]}'
+        assert "blocked.shell_injection" in check_ast_safety(src)
+
+    def test_safe_listcomp_no_flag(self) -> None:
+        src = '[x * 2 for x in [1, 2, 3]]'
+        assert check_ast_safety(src) == []
+
+
+class TestW20GeneratorYieldTaint:
+    """W20 C3: Generator yield/yield from taint propagation."""
+
+    def test_yield_dangerous_callable(self) -> None:
+        src = 'import os\ndef gen():\n    yield os.system\nf = next(gen())\nf("id")'
+        assert "blocked.shell_injection" in check_ast_safety(src)
+
+    @pytest.mark.xfail(reason="W20.1: yield from cross-function taint not yet chained")
+    def test_yield_from_chain(self) -> None:
+        src = (
+            'import os\n'
+            'def inner():\n    yield os.environ\n'
+            'def outer():\n    yield from inner()\n'
+        )
+        assert "blocked.credential_exfil" in check_ast_safety(src)
+
+    def test_contextmanager_yield(self) -> None:
+        src = (
+            'import os\nfrom contextlib import contextmanager\n'
+            '@contextmanager\ndef cm():\n    yield os.system\n'
+            'with cm() as f:\n    f("id")'
+        )
+        assert "blocked.shell_injection" in check_ast_safety(src)
+
+    def test_safe_yield_no_flag(self) -> None:
+        src = 'def gen():\n    yield 42\nv = next(gen())'
+        assert check_ast_safety(src) == []
+
+
+class TestW20FalsePositiveFixes:
+    """W20 FP1: _scan_function_returns skips nested scopes."""
+
+    def test_nested_helper_return_no_false_positive(self) -> None:
+        src = (
+            'import os\n'
+            'def outer():\n'
+            '    def inner():\n'
+            '        return os.system\n'
+            '    return 42\n'
+            'v = outer()\n'
+        )
+        # outer() itself returns 42, NOT os.system
+        assert check_ast_safety(src) == []
+
+    def test_nested_class_return_no_false_positive(self) -> None:
+        src = (
+            'import os\n'
+            'def outer():\n'
+            '    class C:\n'
+            '        def m(self):\n'
+            '            return os.system\n'
+            '    return C\n'
+        )
+        assert check_ast_safety(src) == []
+
+
+class TestW20ClassBodyTaint:
+    """W20 C1: Class body assignment taint promotion."""
+
+    def test_class_body_dangerous_call(self) -> None:
+        src = 'import os\nclass C:\n    run = os.system\nC.run("id")'
+        assert "blocked.shell_injection" in check_ast_safety(src)
+
+    @pytest.mark.xfail(reason="W20.1: class body credential attribute chaining not yet tracked")
+    def test_class_body_credential(self) -> None:
+        src = 'import os\nclass C:\n    env = os.environ\nC.env.get("PASSWORD")'
+        assert "blocked.credential_exfil" in check_ast_safety(src)
+
+    def test_safe_class_body_no_flag(self) -> None:
+        src = 'class C:\n    x = 42\nC.x'
+        assert check_ast_safety(src) == []
+
+
+class TestW20HigherOrderFunctions:
+    """W20 H2: map/filter with dangerous callables."""
+
+    def test_map_os_system(self) -> None:
+        src = 'import os; list(map(os.system, ["id"]))'
+        assert "blocked.shell_injection" in check_ast_safety(src)
+
+    def test_filter_dangerous(self) -> None:
+        src = 'import os; list(filter(os.system, ["id"]))'
+        assert "blocked.shell_injection" in check_ast_safety(src)
+
+    def test_map_safe_no_flag(self) -> None:
+        src = 'list(map(str, [1, 2, 3]))'
+        assert check_ast_safety(src) == []
+
+
+class TestW20SetattrSmuggling:
+    """W20 H3: setattr with dangerous value."""
+
+    def test_setattr_os_system(self) -> None:
+        src = 'import os\nclass C: pass\nsetattr(C, "run", os.system)'
+        assert "blocked.shell_injection" in check_ast_safety(src)
+
+    def test_setattr_safe_no_flag(self) -> None:
+        src = 'class C: pass\nsetattr(C, "x", 42)'
+        assert check_ast_safety(src) == []
+
+
+class TestW20StringAssembly:
+    """W20 H1/H4: str.join and f-string bypass vectors."""
+
+    def test_str_join_dunder(self) -> None:
+        src = 'import builtins; s = "".join(["__","glo","bals__"]); getattr(builtins, s)'
+        assert "blocked.shell_injection" in check_ast_safety(src)
+
+    def test_fstring_dunder(self) -> None:
+        src = 'attr = f"__glob{"als"}__"\ngetattr(object, attr)'
+        assert "blocked.shell_injection" in check_ast_safety(src)
+
+    def test_str_join_safe_no_flag(self) -> None:
+        src = 's = "".join(["hello", " ", "world"])'
+        assert check_ast_safety(src) == []
+
+
+class TestW20NearCapabilitiesFP3:
+    """W20 FP3: _is_near_capabilities false positives on suffixed keys."""
+
+    def test_capability_notes_not_typo(self) -> None:
+        from openspace.skill_engine.skill_utils import _is_near_capabilities
+        assert _is_near_capabilities("capability_notes") is False
+
+    def test_capability_map_not_typo(self) -> None:
+        from openspace.skill_engine.skill_utils import _is_near_capabilities
+        assert _is_near_capabilities("capability-map") is False
+
+    def test_capabilites_still_typo(self) -> None:
+        from openspace.skill_engine.skill_utils import _is_near_capabilities
+        assert _is_near_capabilities("capabilites") is True
+
+    def test_cpabilities_still_typo(self) -> None:
+        from openspace.skill_engine.skill_utils import _is_near_capabilities
+        assert _is_near_capabilities("cpabilities") is True

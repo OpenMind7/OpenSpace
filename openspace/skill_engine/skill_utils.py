@@ -472,6 +472,10 @@ def _is_near_capabilities(key: str) -> bool:
     if key == target:
         return False  # exact match — not a typo
     key_lower = key.lower()
+    # W20 FP3: Exclude keys with extra suffix segments (_, -)
+    # e.g., "capability_notes", "capability-map" are not typos
+    if "_" in key_lower or "-" in key_lower:
+        return False
     # Prefix check: covers capabilites, capablities, capability, etc.
     if key_lower.startswith("capab"):
         return True

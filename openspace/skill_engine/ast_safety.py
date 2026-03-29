@@ -191,6 +191,9 @@ class DangerousNodeVisitor(ast.NodeVisitor):
         # W17 C4: Track function return taint for decorator analysis
         # func_name -> resolved dangerous return value
         self._func_return_taint: Dict[str, str] = {}
+        # W20 C1: Track class body assignments for taint promotion
+        # "ClassName.attr" -> resolved dangerous value
+        self._class_attr_taint: Dict[str, str] = {}
 
     # --- Import tracking + assignment taint ---
 
@@ -296,6 +299,74 @@ class DangerousNodeVisitor(ast.NodeVisitor):
         self._check_decorator_taint(node)
         self.generic_visit(node)
 
+    # --- W20 C1: Class body assignment taint promotion ---
+
+    def visit_ClassDef(self, node: ast.ClassDef) -> None:
+        """Track class body assignments and promote them to class-level aliases.
+
+        W20 C1: ``class C: run = os.system`` makes C.run dangerous. We scan
+        the class body for simple assignments and promote them so that
+        ``C.run(...)`` or attribute access resolves correctly.
+        Also handles metaclass ``__prepare__`` via type()-3-arg in _check_simple_call.
+        """
+        class_name = node.name
+        for stmt in node.body:
+            if isinstance(stmt, ast.Assign):
+                for target in stmt.targets:
+                    if isinstance(target, ast.Name):
+                        resolved = self._peel_to_resolve(stmt.value)
+                        if resolved is not None and self._is_dangerous_resolved(resolved):
+                            qual = f"{class_name}.{target.id}"
+                            self._name_aliases[qual] = resolved
+                            self._class_attr_taint[qual] = resolved
+                    self._check_dangerous_attr_assign(target, stmt.value)
+            elif isinstance(stmt, ast.AnnAssign) and stmt.value:
+                if isinstance(stmt.target, ast.Name):
+                    resolved = self._peel_to_resolve(stmt.value)
+                    if resolved is not None and self._is_dangerous_resolved(resolved):
+                        qual = f"{class_name}.{stmt.target.id}"
+                        self._name_aliases[qual] = resolved
+                        self._class_attr_taint[qual] = resolved
+        self.generic_visit(node)
+
+    # --- W20 C2: Comprehension taint tracking ---
+
+    def _visit_comprehension(self, node: ast.expr) -> None:
+        """Propagate taint through comprehension generators.
+
+        W20 C2: Comprehension iteration targets (e.g. ``x`` in
+        ``[x for x in [os.system]]``) were untracked. This handles
+        ListComp, SetComp, GeneratorExp, and DictComp.
+        """
+        generators: List[ast.comprehension] = getattr(node, "generators", [])
+        for gen in generators:
+            if isinstance(gen.iter, (ast.List, ast.Tuple, ast.Set)):
+                for elt in gen.iter.elts:
+                    self._propagate_taint_target(gen.target, elt)
+            else:
+                # Try resolving the iterable (e.g., a Name aliased to a list)
+                self._propagate_taint_target(gen.target, gen.iter)
+
+    def visit_ListComp(self, node: ast.ListComp) -> None:
+        """W20 C2: Track list comprehension iteration taint."""
+        self._visit_comprehension(node)
+        self.generic_visit(node)
+
+    def visit_SetComp(self, node: ast.SetComp) -> None:
+        """W20 C2: Track set comprehension iteration taint."""
+        self._visit_comprehension(node)
+        self.generic_visit(node)
+
+    def visit_GeneratorExp(self, node: ast.GeneratorExp) -> None:
+        """W20 C2: Track generator expression iteration taint."""
+        self._visit_comprehension(node)
+        self.generic_visit(node)
+
+    def visit_DictComp(self, node: ast.DictComp) -> None:
+        """W20 C2: Track dict comprehension iteration taint."""
+        self._visit_comprehension(node)
+        self.generic_visit(node)
+
     def _propagate_default_args(
         self, node: ast.FunctionDef | ast.AsyncFunctionDef
     ) -> None:
@@ -378,8 +449,13 @@ class DangerousNodeVisitor(ast.NodeVisitor):
 
         # W16 HIGH-3: string constant assignment (a = "__globals__")
         # Store in _name_aliases so _check_getattr can resolve it.
+        # W20 H1/H4: Also resolve str.join() and f-strings via _resolve_string_expr
         if isinstance(value, ast.Constant) and isinstance(value.value, str):
             self._name_aliases[target_name] = value.value
+            return
+        str_val = self._resolve_string_expr(value)
+        if str_val is not None:
+            self._name_aliases[target_name] = str_val
             return
 
         resolved = self._resolve_rhs(value)
@@ -538,6 +614,23 @@ class DangerousNodeVisitor(ast.NodeVisitor):
             if resolved is not None and self._is_dangerous_resolved(resolved):
                 return resolved
 
+        # W20 C2: Subscript on ListComp/Tuple/List → resolve element
+        if isinstance(node, ast.Subscript) and isinstance(
+            node.value, (ast.ListComp, ast.SetComp, ast.GeneratorExp, ast.List, ast.Tuple)
+        ):
+            return self._peel_to_resolve(node.value)
+
+        # W20 C2: Comprehension/GeneratorExp → process generators inline,
+        # resolve .elt through the resulting taint.
+        if isinstance(node, (ast.ListComp, ast.SetComp, ast.GeneratorExp)):
+            for gen in node.generators:
+                if isinstance(gen.iter, (ast.List, ast.Tuple, ast.Set)):
+                    for elt in gen.iter.elts:
+                        self._propagate_taint_target(gen.target, elt)
+                else:
+                    self._propagate_taint_target(gen.target, gen.iter)
+            return self._peel_to_resolve(node.elt)
+
         return None
 
     # --- W17: Helper methods for new bypass detection ---
@@ -618,12 +711,60 @@ class DangerousNodeVisitor(ast.NodeVisitor):
     def _scan_function_returns(
         self, node: ast.FunctionDef | ast.AsyncFunctionDef
     ) -> None:
-        """W17 C4: Scan function body for return statements with dangerous values."""
-        for child in ast.walk(node):
-            if isinstance(child, ast.Return) and child.value is not None:
-                resolved = self._peel_to_resolve(child.value)
+        """W17 C4 + W20 C3/FP1: Scan function body for dangerous return/yield values.
+
+        W20 C3: Also scans Yield and YieldFrom nodes (generator taint).
+        W20 FP1: Only scans the current function's own statements — explicitly
+        skips nested FunctionDef, AsyncFunctionDef, Lambda, and ClassDef to
+        avoid false positives where an inner helper's return taints the outer.
+        """
+        self._scan_body_for_taint(node.body, node.name)
+
+    def _scan_body_for_taint(
+        self, stmts: List[ast.stmt], func_name: str
+    ) -> None:
+        """Recursively scan statements for Return/Yield/YieldFrom, skipping nested scopes."""
+        for stmt in stmts:
+            # Check the statement itself
+            if isinstance(stmt, ast.Return) and stmt.value is not None:
+                resolved = self._peel_to_resolve(stmt.value)
                 if resolved is not None and self._is_dangerous_resolved(resolved):
-                    self._func_return_taint[node.name] = resolved
+                    self._func_return_taint[func_name] = resolved
+                    return
+            # W20 C3: Yield taint — generators can return dangerous values
+            if isinstance(stmt, ast.Expr) and isinstance(stmt.value, ast.Yield):
+                yield_val = stmt.value.value
+                if yield_val is not None:
+                    resolved = self._peel_to_resolve(yield_val)
+                    if resolved is not None and self._is_dangerous_resolved(resolved):
+                        self._func_return_taint[func_name] = resolved
+                        return
+            if isinstance(stmt, ast.Expr) and isinstance(stmt.value, ast.YieldFrom):
+                yield_val = stmt.value.value
+                if yield_val is not None:
+                    # Check if the yielded-from iterable is a call to a tainted func
+                    resolved = self._peel_to_resolve(yield_val)
+                    if resolved is not None and self._is_dangerous_resolved(resolved):
+                        self._func_return_taint[func_name] = resolved
+                        return
+
+            # W20 FP1: Skip nested scopes — their returns don't belong to us
+            if isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                continue
+
+            # Recurse into compound statements (if/for/while/try/with bodies)
+            for attr in ("body", "orelse", "finalbody", "handlers"):
+                child_stmts = getattr(stmt, attr, None)
+                if isinstance(child_stmts, list):
+                    for child in child_stmts:
+                        if isinstance(child, ast.stmt):
+                            self._scan_body_for_taint([child], func_name)
+                            if func_name in self._func_return_taint:
+                                return
+            # ExceptHandler has body
+            if isinstance(stmt, ast.ExceptHandler):
+                self._scan_body_for_taint(stmt.body, func_name)
+                if func_name in self._func_return_taint:
                     return
 
     def _check_decorator_taint(
@@ -671,6 +812,8 @@ class DangerousNodeVisitor(ast.NodeVisitor):
 
         W19 H6: Recursive BinOp(Add) folding for nested concatenation.
         Catches: ``"__" + "glo" + "bals__"`` (parsed as nested BinOp).
+        W20 H1: ``"".join(["__", "glob", "als__"])`` — Call on str.join with list of constants.
+        W20 H4: ``f"__{'glob'}als__"`` — JoinedStr (f-string) with all-constant parts.
         """
         if isinstance(node, ast.Constant) and isinstance(node.value, str):
             return node.value
@@ -684,6 +827,40 @@ class DangerousNodeVisitor(ast.NodeVisitor):
             right = self._resolve_string_expr(node.right)
             if left is not None and right is not None:
                 return left + right
+        # W20 H1: "".join([...]) / str.join("", [...]) — join with list of constants
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute):
+            if node.func.attr == "join" and len(node.args) == 1:
+                # Check receiver is a string constant (e.g., "".join(...))
+                receiver = node.func.value
+                sep = None
+                if isinstance(receiver, ast.Constant) and isinstance(receiver.value, str):
+                    sep = receiver.value
+                if sep is not None:
+                    arg = node.args[0]
+                    if isinstance(arg, (ast.List, ast.Tuple)):
+                        parts = []
+                        for elt in arg.elts:
+                            r = self._resolve_string_expr(elt)
+                            if r is None:
+                                break
+                            parts.append(r)
+                        else:
+                            return sep.join(parts)
+        # W20 H4: f-strings (JoinedStr) — resolve if all parts are constants/FormattedValues
+        if isinstance(node, ast.JoinedStr):
+            parts = []
+            for val in node.values:
+                if isinstance(val, ast.Constant) and isinstance(val.value, str):
+                    parts.append(val.value)
+                elif isinstance(val, ast.FormattedValue):
+                    inner = self._resolve_string_expr(val.value)
+                    if inner is not None:
+                        parts.append(inner)
+                    else:
+                        return None
+                else:
+                    return None
+            return "".join(parts)
         return None
 
     # --- Call analysis ---
@@ -738,6 +915,21 @@ class DangerousNodeVisitor(ast.NodeVisitor):
             self._check_getattr(node)
             return
 
+        # W20 H3: setattr(obj, "attr", dangerous_value)
+        if name == "setattr" and len(node.args) >= 3:
+            resolved = self._peel_to_resolve(node.args[2])
+            if resolved is not None and self._is_dangerous_resolved(resolved):
+                self.flags.append(self._flag_for_resolved(resolved))
+            return
+
+        # W20 H2: map(dangerous_func, ...) / filter(dangerous_func, ...)
+        # Higher-order functions that invoke the first argument as a callable
+        if name in ("map", "filter") and node.args:
+            resolved = self._peel_to_resolve(node.args[0])
+            if resolved is not None and self._is_dangerous_resolved(resolved):
+                self.flags.append(self._flag_for_resolved(resolved))
+            return
+
         # Check if this name is an alias for a dangerous function
         if name in self._name_aliases:
             qualified = self._name_aliases[name]
@@ -771,6 +963,14 @@ class DangerousNodeVisitor(ast.NodeVisitor):
             # _name_aliases maps "environ" → "os.environ"
             resolved = self._name_aliases[root]
             chain = f"{resolved}.{parts[1]}" if len(parts) > 1 else resolved
+
+        # W20 C1: Check full chain against _name_aliases (class body taint)
+        # e.g., "C.run" → "os.system" from visit_ClassDef
+        if chain in self._name_aliases:
+            resolved_full = self._name_aliases[chain]
+            if self._is_dangerous_resolved(resolved_full):
+                self.flags.append(self._flag_for_resolved(resolved_full))
+                return
 
         self._check_qualified_call(chain)
 
@@ -1031,6 +1231,12 @@ class DangerousNodeVisitor(ast.NodeVisitor):
             self._check_simple_call(func.id, node)
         elif isinstance(func, ast.Attribute):
             self._check_attribute_call(func, node)
+        else:
+            # W20: Complex expression calls (e.g., [comp][0]("id"), next(gen)("id"))
+            # Try resolving func through _peel_to_resolve for dangerous callables.
+            resolved = self._peel_to_resolve(func)
+            if resolved is not None and self._is_dangerous_resolved(resolved):
+                self.flags.append(self._flag_for_resolved(resolved))
 
         self.generic_visit(node)
 
