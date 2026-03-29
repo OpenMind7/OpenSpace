@@ -320,6 +320,30 @@ class DangerousNodeVisitor(ast.NodeVisitor):
             recv_resolved = self._peel_to_resolve(receiver)
             if recv_resolved is not None and self._is_dangerous_resolved(recv_resolved):
                 self._propagate_taint_target(target, receiver)
+                return
+        # W22 H3: itertools.chain / itertools.chain.from_iterable — propagate
+        # taint from any argument that contains dangerous elements
+        if isinstance(iterable, ast.Call):
+            call_func = iterable.func
+            chain_name = None
+            if isinstance(call_func, ast.Attribute):
+                chain_name = _resolve_attr_chain(call_func)
+                if chain_name and chain_name.split(".")[0] in self._module_aliases:
+                    root = chain_name.split(".")[0]
+                    chain_name = chain_name.replace(root, self._module_aliases[root], 1)
+            if chain_name in ("itertools.chain", "itertools.chain.from_iterable"):
+                for arg in iterable.args:
+                    arg_resolved = self._peel_to_resolve(arg)
+                    if arg_resolved is not None and self._is_dangerous_resolved(arg_resolved):
+                        self._propagate_taint_target(target, arg)
+                        return
+                    # Also check list/tuple literal args for tainted elements
+                    if isinstance(arg, (ast.List, ast.Tuple)):
+                        for elt in arg.elts:
+                            elt_resolved = self._peel_to_resolve(elt)
+                            if elt_resolved is not None and self._is_dangerous_resolved(elt_resolved):
+                                self._propagate_taint_target(target, elt)
+                                return
 
     def visit_With(self, node: ast.With) -> None:
         """Track with-statement taint: ``with open(...) as f: ...``"""
@@ -1095,8 +1119,8 @@ class DangerousNodeVisitor(ast.NodeVisitor):
                 self.flags.append(self._flag_for_resolved(resolved))
             return
 
-        # W20 H2: map(dangerous_func, ...) / filter(dangerous_func, ...)
-        # Higher-order functions that invoke the first argument as a callable
+        # W20 H2 + W22 H2: Higher-order functions that invoke args as callables
+        # map/filter use first arg, functools.reduce uses first arg
         if name in ("map", "filter") and node.args:
             resolved = self._peel_to_resolve(node.args[0])
             if resolved is not None and self._is_dangerous_resolved(resolved):
@@ -1165,10 +1189,30 @@ class DangerousNodeVisitor(ast.NodeVisitor):
                 resolved_prefix = self._module_aliases[prefix]
                 suffix = ".".join(dot_parts[i:])
                 resolved_chain = f"{resolved_prefix}.{suffix}"
+                # W22 H2: higher-order callable check before standard dispatch
+                self._check_higher_order_call(resolved_chain, node)
                 self._check_qualified_call(resolved_chain)
                 return
 
         self._check_qualified_call(chain)
+
+    def _check_higher_order_call(self, qualified: str, node: ast.Call) -> None:
+        """W22: Check higher-order functions that launder dangerous callables.
+
+        functools.reduce(fn, iterable) — iterable may contain dangerous elements.
+        itertools.starmap(fn, iterable) — fn applied to iterable elements.
+        """
+        if qualified == "functools.reduce" and len(node.args) >= 2:
+            iterable_arg = node.args[1]
+            if isinstance(iterable_arg, (ast.List, ast.Tuple)):
+                for elt in iterable_arg.elts:
+                    elt_resolved = self._peel_to_resolve(elt)
+                    if elt_resolved is not None and self._is_dangerous_resolved(elt_resolved):
+                        self.flags.append(self._flag_for_resolved(elt_resolved))
+                        return
+            fn_resolved = self._peel_to_resolve(node.args[0])
+            if fn_resolved is not None and self._is_dangerous_resolved(fn_resolved):
+                self.flags.append(self._flag_for_resolved(fn_resolved))
 
     def _check_qualified_call(self, qualified: str) -> None:
         """Check a fully-qualified call path like ``os.system`` or ``subprocess.run``."""
@@ -1318,6 +1362,31 @@ class DangerousNodeVisitor(ast.NodeVisitor):
                 self.flags.append("blocked.credential_exfil")
             elif attr_arg in _DANGEROUS_OS_ENVIRON_METHODS:
                 self.flags.append("blocked.credential_exfil")
+            return
+
+        # W22 CRIT: getattr(builtins, <dynamic>) — fail-closed (Codex finding)
+        # builtins module contains eval/exec/__import__ — dynamic attr is dangerous
+        if resolved_mod == "builtins":
+            if attr_arg is None:
+                # Dynamic attr name — fail-closed
+                self.flags.append("blocked.shell_injection")
+            elif attr_arg in _BLANKET_BLOCKED_BUILTINS or attr_arg == "__import__":
+                self.flags.append("blocked.shell_injection")
+            return
+
+        # W22 CRIT: getattr on class attributes — resolve through _class_attr_taint
+        if resolved_mod in self._class_attr_taint:
+            taint_source = self._class_attr_taint[resolved_mod]
+            if attr_arg is None:
+                # Dynamic attr on tainted class attribute — fail-closed
+                if "environ" in taint_source:
+                    self.flags.append("blocked.credential_exfil")
+                else:
+                    self.flags.append("blocked.shell_injection")
+            elif "environ" in taint_source and attr_arg in _DANGEROUS_OS_ENVIRON_METHODS:
+                self.flags.append("blocked.credential_exfil")
+            elif attr_arg in _DANGEROUS_OS_FUNCS:
+                self.flags.append("blocked.shell_injection")
             return
 
         if resolved_mod in _ALL_DANGEROUS_MODULES or resolved_mod == "os":

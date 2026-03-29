@@ -1931,3 +1931,118 @@ class TestW211PosixFork:
     def test_from_posix_import_fork(self) -> None:
         src = 'from posix import fork\nfork()\n'
         assert "blocked" in str(check_ast_safety(src))
+
+
+# ---------------------------------------------------------------------------
+# W22: getattr(builtins, dynamic) fail-closed (Codex W20.1 CRIT)
+# ---------------------------------------------------------------------------
+
+class TestW22BuiltinsGetattr:
+    """W22: getattr(builtins, <non-constant>) must fail-closed."""
+
+    def test_builtins_dynamic_name_blocked(self) -> None:
+        """getattr(builtins, dynamic) → fail-closed."""
+        src = (
+            'import builtins\n'
+            'name = "eval"\n'
+            'getattr(builtins, name)("1+1")\n'
+        )
+        assert "blocked.shell_injection" in check_ast_safety(src)
+
+    def test_builtins_format_bypass_blocked(self) -> None:
+        """format(101, 'c') string assembly → builtins getattr still blocked."""
+        src = (
+            'import builtins\n'
+            'name = format(101, "c") + format(118, "c") + format(97, "c") + format(108, "c")\n'
+            'getattr(builtins, name)("1+1")\n'
+        )
+        assert "blocked.shell_injection" in check_ast_safety(src)
+
+    def test_builtins_known_dangerous_blocked(self) -> None:
+        """getattr(builtins, "exec") with constant → blocked."""
+        src = 'import builtins\ngetattr(builtins, "exec")("import os")\n'
+        assert "blocked.shell_injection" in check_ast_safety(src)
+
+    def test_builtins_import_blocked(self) -> None:
+        src = 'import builtins\ngetattr(builtins, "__import__")("os")\n'
+        assert "blocked.shell_injection" in check_ast_safety(src)
+
+
+# ---------------------------------------------------------------------------
+# W22: functools.reduce callable laundering (Codex W20.1 HIGH)
+# ---------------------------------------------------------------------------
+
+class TestW22FunctoolsReduce:
+    """W22: functools.reduce must check first arg for dangerous callables."""
+
+    def test_reduce_with_dangerous_callable(self) -> None:
+        src = (
+            'import functools, os\n'
+            'functools.reduce(lambda acc, f: f, [None, os.system])("id")\n'
+        )
+        assert "blocked.shell_injection" in check_ast_safety(src)
+
+    def test_reduce_with_safe_callable(self) -> None:
+        src = 'import functools\nfunctools.reduce(lambda a, b: a + b, [1, 2, 3])\n'
+        assert check_ast_safety(src) == []
+
+
+# ---------------------------------------------------------------------------
+# W22: itertools.chain taint propagation (Codex W20.1 HIGH)
+# ---------------------------------------------------------------------------
+
+class TestW22ItertoolsChain:
+    """W22: for f in itertools.chain([os.system]) must propagate taint."""
+
+    def test_chain_with_dangerous_list(self) -> None:
+        src = (
+            'import itertools, os\n'
+            'for f in itertools.chain([os.system]):\n'
+            '    f("id")\n'
+        )
+        assert "blocked.shell_injection" in check_ast_safety(src)
+
+    def test_chain_with_safe_list(self) -> None:
+        src = (
+            'import itertools\n'
+            'for x in itertools.chain([1, 2], [3, 4]):\n'
+            '    print(x)\n'
+        )
+        assert check_ast_safety(src) == []
+
+
+# ---------------------------------------------------------------------------
+# W22: getattr(C.attr, method) class attribute bypass (Codex W20.1 HIGH)
+# ---------------------------------------------------------------------------
+
+class TestW22GetattrClassAttr:
+    """W22: getattr(C.env, 'get') must resolve class attribute taint."""
+
+    def test_getattr_class_env_blocked(self) -> None:
+        src = (
+            'import os\n'
+            'class C:\n'
+            '    env = os.environ\n'
+            'getattr(C.env, "get")("PASSWORD")\n'
+        )
+        assert "blocked.credential_exfil" in check_ast_safety(src)
+
+    def test_getattr_class_module_blocked(self) -> None:
+        src = (
+            'import os\n'
+            'class C:\n'
+            '    mod = os\n'
+            'getattr(C.mod, "system")("id")\n'
+        )
+        assert "blocked.shell_injection" in check_ast_safety(src)
+
+    def test_getattr_class_env_dynamic_blocked(self) -> None:
+        """Dynamic attr on tainted class attr → fail-closed."""
+        src = (
+            'import os\n'
+            'class C:\n'
+            '    env = os.environ\n'
+            'm = "get"\n'
+            'getattr(C.env, m)("PASSWORD")\n'
+        )
+        assert "blocked.credential_exfil" in check_ast_safety(src)
