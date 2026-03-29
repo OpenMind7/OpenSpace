@@ -567,17 +567,12 @@ class GroundingAgent(BaseAgent):
             if capabilities_need_shell(self._skill_capabilities):
                 shell_bt = BackendType.SHELL
                 if shell_bt not in backends:
-                    if "shell" in self._backend_scope:
-                        # Shell is in scope but not yet in the BackendType list
-                        # (shouldn't normally happen, but guard anyway)
-                        backends = list(backends) + [shell_bt]
-                        logger.info("Added Shell backend to scope for skill capabilities")
-                    else:
-                        # S5 guard: session explicitly excluded shell — do NOT escalate
-                        logger.warning(
-                            "Skill capabilities require shell but session scope "
-                            "excludes it — not escalating (S5 shell-guard)"
-                        )
+                    # S5 guard: shell is missing from backends, which means
+                    # it was excluded from _backend_scope — do NOT escalate.
+                    logger.warning(
+                        "Skill capabilities require shell but session scope "
+                        "excludes it — not escalating (S5 shell-guard)"
+                    )
 
         try:
             retrieval_llm = self._tool_retrieval_llm or self._llm_client

